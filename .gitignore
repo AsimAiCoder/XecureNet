@@ -1,20 +1,171 @@
+# ============================================
 # Logs
+# ============================================
 *.log
+*.log.*
+logs/
 
+# ============================================
 # Temporary files
+# ============================================
 *.tmp
 *.swp
 *~
+*.bak
+*.backup
+*.swo
+.~*
+tmpclaude-*
+temp/
+tmp/
 
+# ============================================
+# Backup/Note directories
+# ============================================
+Note/
+notes/
+backup/
+backups/
+
+# ============================================
 # OS files
+# ============================================
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+Desktop.ini
 
-# IDE
+# ============================================
+# IDE & Editor files
+# ============================================
 .vscode/
 .idea/
 *.sublime-*
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.project
+.classpath
+.c9/
+*.jetbrains
+.settings/
+*.iml
+.gradle/
+.cache/
+.hypothesis/
+.LSOverride
 
-# Test files
+# ============================================
+# Node.js
+# ============================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+.npm
+.eslintcache
+.node-gyp/
+dist/
+build/
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv
+.env.local
+.pyenv
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# ============================================
+# Test files & coverage
+# ============================================
 test/
+tests/
 *.test.sh
+coverage/
+.nyc_output/
+coverage.xml
+
+# ============================================
+# Generated project files (from deploy)
+# ============================================
+projects/
+deployments/
+*.env
+.env
+.env.*
+!.env.example
+
+# ============================================
+# Runtime data
+# ============================================
+auth_info/
+*-data/
+data/
+*.pid
+*.seed
+*.pid.lock
+.cache/
+
+# ============================================
+# Docker & Container artifacts
+# ============================================
+*.swp
+.docker/
+docker-compose.override.yml
+
+# ============================================
+# Build artifacts
+# ============================================
+*.o
+*.a
+*.so
+dist/
+build/
+*.egg-info/
+
+# ============================================
+# System & Process
+# ============================================
+*.sock
+*.pid
+.lock
+*.lock

@@ -1,23 +1,38 @@
 #!/bin/bash
-# XecureNet - Automated VM Optimization Tool
-# Version: 1.0.0
+# XecureNet - Automated VM Optimization & Deployment Tool
+# Version: 2.0.0
 # Author: Asim Coder (@AsimAiCoder)
 # Telegram: @AsimAiCoder
 # GitHub: https://github.com/asimaicoder/XecureNet
-# Raw URL: https://raw.githubusercontent.com/asimaicoder/XecureNet/main/xecurenet
-# CDN URL: https://cdn.jsdelivr.net/gh/asimaicoder/XecureNet@main/xecurenet
 # Install: curl -fsSL https://raw.githubusercontent.com/asimaicoder/XecureNet/main/install.sh | sudo bash
 # License: MIT
-# Made with ❤️ for the Open Source Community
 
-set -e
+set -eo pipefail
 
-VERSION="1.0.0"
-CONFIG_DIR="$HOME/.xecurenet"
+VERSION="2.0.0"
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SETUP_MODE="${XECURENET_MODE:-}"
+
+# --- Resolve real user (fixes $HOME / $SUDO_USER bugs) ---
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    REAL_USER="$(whoami)"
+    REAL_HOME="$HOME"
+fi
+
+CONFIG_DIR="$REAL_HOME/.xecurenet"
 LOG_FILE="$CONFIG_DIR/setup.log"
 CONFIG_FILE="$CONFIG_DIR/config"
-SCRIPT_PATH="$(readlink -f "$0")"
-SETUP_MODE=""
+PROJECTS_DIR="$REAL_HOME/projects"
+DEPLOY_REGISTRY="$CONFIG_DIR/deployed_services"
+
+# Create config dir (as real user, not root)
+mkdir -p "$CONFIG_DIR"
+if [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
+    chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$CONFIG_DIR"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -27,31 +42,29 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
-# Create config dir
-mkdir -p "$CONFIG_DIR"
+# --- Logging ---
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null; }
 
-# Logging
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
-
-# Print functions
+# --- Print functions ---
 print_success() { echo -e "${GREEN}✓${NC} $1"; log "SUCCESS: $1"; }
-print_error() { echo -e "${RED}✗${NC} $1"; log "ERROR: $1"; }
-print_info() { echo -e "${BLUE}ℹ${NC} $1"; log "INFO: $1"; }
+print_error()   { echo -e "${RED}✗${NC} $1"; log "ERROR: $1"; }
+print_info()    { echo -e "${BLUE}ℹ${NC} $1"; log "INFO: $1"; }
 print_warning() { echo -e "${YELLOW}⚠${NC} $1"; log "WARNING: $1"; }
 
-# Banner
+# --- Banner ---
 show_banner() {
     echo -e "${CYAN}"
     cat << "EOF"
 
   ██╗  ██╗███████╗ ██████╗██╗   ██╗██████╗ ███████╗███╗   ██╗███████╗████████╗
   ╚██╗██╔╝██╔════╝██╔════╝██║   ██║██╔══██╗██╔════╝████╗  ██║██╔════╝╚══██╔══╝
-   ╚███╔╝ █████╗  ██║     ██║   ██║██████╔╝█████╗  ██╔██╗ ██║█████╗     ██║   
-   ██╔██╗ ██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝  ██║╚██╗██║██╔══╝     ██║   
-  ██╔╝ ██╗███████╗╚██████╗╚██████╔╝██║  ██║███████╗██║ ╚████║███████╗   ██║   
-  ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚══════╝   ╚═╝   
+   ╚███╔╝ █████╗  ██║     ██║   ██║██████╔╝█████╗  ██╔██╗ ██║█████╗     ██║
+   ██╔██╗ ██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝  ██║╚██╗██║██╔══╝     ██║
+  ██╔╝ ██╗███████╗╚██████╗╚██████╔╝██║  ██║███████╗██║ ╚████║███████╗   ██║
+  ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚══════╝   ╚═╝
 
 EOF
     echo -e "${GREEN}          🔒 Secure. ⚡ Lightweight. 🐳 Container-Ready.${NC}"
@@ -62,380 +75,2412 @@ EOF
     echo ""
 }
 
-# Check root
+# ============================================================
+# OS DETECTION (reads vars via grep, not source)
+# ============================================================
+OS_ID=""
+OS_VERSION=""
+OS_PRETTY=""
+
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        OS_ID=$(grep -oP '^ID=\K.*' /etc/os-release | tr -d '"')
+        OS_VERSION=$(grep -oP '^VERSION_ID=\K.*' /etc/os-release | tr -d '"')
+        OS_PRETTY=$(grep -oP '^PRETTY_NAME=\K.*' /etc/os-release | tr -d '"')
+    else
+        print_error "Cannot detect OS. /etc/os-release not found."
+        exit 1
+    fi
+
+    case "$OS_ID" in
+        debian|ubuntu) ;;
+        *)
+            print_warning "Unsupported OS: $OS_PRETTY"
+            print_warning "XecureNet is tested on Debian 12+ and Ubuntu 22.04+"
+            print_info "Continuing anyway — some features may not work"
+            ;;
+    esac
+}
+
+# ============================================================
+# ROOT CHECK
+# ============================================================
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root (use sudo)"
         exit 1
     fi
+    if [[ -z "${SUDO_USER:-}" ]]; then
+        print_warning "Running as direct root (no sudo detected)"
+        print_info "Some user-level features may not work. Recommended: use sudo"
+    fi
 }
 
-# Select mode
-select_mode() {
-    echo -e "${CYAN}${BOLD}🎯 Select Setup Mode:${NC}\n"
-    echo -e "${YELLOW}[1]${NC} ${BOLD}Manual Mode${NC} - Step-by-step with explanations ${GREEN}(Recommended)${NC}"
-    echo -e "    ${CYAN}→${NC} You'll be asked before each action"
-    echo -e "    ${CYAN}→${NC} Detailed explanations provided"
-    echo -e "    ${CYAN}→${NC} Full control over the process\n"
-    
-    echo -e "${YELLOW}[2]${NC} ${BOLD}Agent Mode${NC} - Fully automated ${BLUE}(For experts)${NC}"
-    echo -e "    ${CYAN}→${NC} No prompts, runs automatically"
-    echo -e "    ${CYAN}→${NC} Faster setup (~2 minutes)"
-    echo -e "    ${CYAN}→${NC} Best for CI/CD pipelines\n"
-    
-    while true; do
-        read -p "$(echo -e "${BOLD}Your choice [1-2]:${NC} ")" mode
-        case "$mode" in
-            1 ) SETUP_MODE="manual"; echo -e "${GREEN}✓${NC} Manual Mode selected\n"; break;;
-            2 ) SETUP_MODE="agent"; echo -e "${GREEN}✓${NC} Agent Mode selected\n"; break;;
-            * ) echo -e "${RED}Please enter 1 or 2${NC}";;
-        esac
-    done
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+generate_password() {
+    local len="${1:-16}"
+    tr -dc 'A-Za-z0-9!@#$%' < /dev/urandom | head -c "$len" 2>/dev/null || openssl rand -base64 "$len" | head -c "$len"
 }
 
-# Ask permission
 ask_permission() {
     local question="$1"
     local details="$2"
-    
     if [[ "$SETUP_MODE" == "agent" ]]; then
         echo -e "${GREEN}✓${NC} Auto-approved: $question"
         return 0
     fi
-    
     echo -e "\n${YELLOW}❓ $question${NC}"
     if [[ -n "$details" ]]; then
         echo -e "${CYAN}ℹ️  Details: $details${NC}"
     fi
-    
     while true; do
         read -p "$(echo -e "${BOLD}Continue? [Y/n]:${NC} ")" choice
         case "$choice" in
-            [Yy]*|"" ) return 0;;
-            [Nn]* ) echo -e "${RED}⏭️  Skipped${NC}"; return 1;;
-            * ) echo -e "${RED}Please answer Y or N${NC}";;
+            [Yy]*|"") return 0;;
+            [Nn]*)    echo -e "${RED}⏭️  Skipped${NC}"; return 1;;
+            *)        echo -e "${RED}Please answer Y or N${NC}";;
         esac
     done
 }
 
-# System check
-system_check() {
-    echo -e "${BLUE}🔍 System Check${NC}\n"
-    
-    if ask_permission "Check system requirements?" "Verifies OS, RAM, disk space, and internet connectivity"; then
-        # OS
-        if [ -f /etc/os-release ]; then
-            . /etc/os-release
-            print_success "OS: $PRETTY_NAME"
-        fi
-        
-        # RAM
-        RAM=$(free -m | awk '/^Mem:/{print $2}')
-        print_success "RAM: ${RAM} MB"
-        if [[ $RAM -lt 800 ]]; then
-            print_warning "Low RAM detected. This tool is optimized for 1GB+ VMs"
-        fi
-        
-        # Disk
-        DISK=$(df -h / | awk 'NR==2{print $2}')
-        print_success "Disk: $DISK"
-        
-        # Internet
-        if ping -c 1 8.8.8.8 &> /dev/null; then
-            print_success "Internet: Connected"
-        else
-            print_error "Internet: Not connected"
-            exit 1
-        fi
-        echo ""
+select_mode() {
+    if [[ "$SETUP_MODE" == "agent" ]]; then
+        echo -e "${GREEN}✓${NC} Agent Mode (set via environment)\n"
+        return
+    fi
+    echo -e "${CYAN}${BOLD}🎯 Select Setup Mode:${NC}\n"
+    echo -e "${YELLOW}[1]${NC} ${BOLD}Manual Mode${NC} - Step-by-step ${GREEN}(Recommended)${NC}"
+    echo -e "    ${CYAN}→${NC} You'll be asked before each action\n"
+    echo -e "${YELLOW}[2]${NC} ${BOLD}Agent Mode${NC} - Fully automated ${BLUE}(For experts)${NC}"
+    echo -e "    ${CYAN}→${NC} No prompts, runs automatically\n"
+    while true; do
+        read -p "$(echo -e "${BOLD}Your choice [1-2]:${NC} ")" mode
+        case "$mode" in
+            1) SETUP_MODE="manual"; echo -e "${GREEN}✓${NC} Manual Mode selected\n"; break;;
+            2) SETUP_MODE="agent";  echo -e "${GREEN}✓${NC} Agent Mode selected\n"; break;;
+            *) echo -e "${RED}Please enter 1 or 2${NC}";;
+        esac
+    done
+}
+
+# ============================================================
+# RAM CALCULATOR (FIXED: proper unit handling)
+# ============================================================
+get_available_ram() {
+    local total_avail
+    total_avail=$(free -m | awk '/^Mem:/{print $7}')
+    local reserved=150
+    local container_ram=$((total_avail - reserved))
+    [[ $container_ram -lt 0 ]] && container_ram=0
+    echo "$container_ram"
+}
+
+get_container_ram_used() {
+    if command -v podman &>/dev/null; then
+        podman stats --no-stream --format "{{.MemUsage}}" 2>/dev/null | awk -F'/' '{
+            val = $1; gsub(/[^0-9.kKmMgG]/, "", val)
+            num = val + 0; unit = val; gsub(/[0-9.]/, "", unit)
+            if (tolower(unit) ~ /g/) num *= 1024
+            else if (tolower(unit) ~ /k/) num /= 1024
+            sum += num
+        } END { printf "%d", sum }' 2>/dev/null || echo "0"
+    else
+        echo "0"
     fi
 }
 
-# Tailscale setup
-setup_tailscale() {
-    echo -e "${CYAN}🔐 Tailscale Setup${NC}\n"
-    
-    if ask_permission "Install and configure Tailscale?" "Tailscale creates a secure P2P network without exposing ports. Size: ~20MB"; then
-        # Install
-        echo -ne "   ${CYAN}→${NC} Installing Tailscale..."
-        if ! command -v tailscale &> /dev/null; then
-            curl -fsSL https://tailscale.com/install.sh | sh &>> "$LOG_FILE"
-            echo -e " ${GREEN}✓${NC}"
+# ============================================================
+# SERVICE CATALOG (25 services, 7 categories)
+# Format: num|slug|name|ram_mb|category|type|port
+# type: ready = pre-built image, scaffold = generates project
+# ============================================================
+SERVICES=(
+    "1|static-site|🌐 Static Website (Nginx)|15|web|ready|8080"
+    "2|webapp-flask|🌍 Web App (Flask/Python)|55|web|scaffold|5000"
+    "3|webapp-express|🌍 Web App (Express/Node.js)|60|web|scaffold|3000"
+    "4|filebrowser|📁 File Manager (FileBrowser)|30|web|ready|8081"
+    "5|telegram-bot-py|🤖 Telegram Bot (Python)|40|bot|scaffold|0"
+    "6|telegram-bot-node|🤖 Telegram Bot (Node.js)|50|bot|scaffold|0"
+    "7|discord-bot-py|💬 Discord Bot (Python)|45|bot|scaffold|0"
+    "8|discord-bot-node|💬 Discord Bot (Node.js)|55|bot|scaffold|0"
+    "9|whatsapp-bot|📱 WhatsApp Bot (Node.js)|80|bot|scaffold|0"
+    "10|combo-bot|🤖 Combo Bot (TG+Discord)|70|bot|scaffold|0"
+    "11|api-fastapi|⚡ API (FastAPI/Python)|50|api|scaffold|8000"
+    "12|api-express|⚡ API (Express/Node.js)|45|api|scaffold|3001"
+    "13|api-graphql|⚡ GraphQL API (Apollo/Node)|55|api|scaffold|4000"
+    "14|mini-saas-py|🚀 Mini SaaS (Python)|70|saas|scaffold|8002"
+    "15|mini-saas-node|🚀 Mini SaaS (Node.js)|65|saas|scaffold|3002"
+    "16|postgres|🐘 PostgreSQL Database|30|db|ready|5432"
+    "17|redis|🔴 Redis Cache|25|db|ready|6379"
+    "18|pg-redis|🐘🔴 PostgreSQL + Redis|55|db|ready|5432"
+    "19|vaultwarden|🔑 Vaultwarden (Bitwarden)|40|infra|ready|8083"
+    "20|privatebin|📋 PrivateBin (Pastebin)|20|infra|ready|8084"
+    "21|uptime-kuma|📊 Uptime Kuma (Monitor)|80|infra|ready|3003"
+    "22|gitea|📂 Gitea (Git Server)|100|infra|ready|3004"
+    "23|n8n|🔄 n8n (Automation)|150|infra|ready|5678"
+    "24|cron-jobs|⏰ Ofelia (Cron Runner)|15|infra|ready|0"
+    "25|dashy|🏠 Dashy (Dashboard)|40|infra|ready|4001"
+)
+
+CATEGORY_NAMES=("web" "bot" "api" "saas" "db" "infra")
+CATEGORY_LABELS=("🌐 Web & Files" "🤖 Bots" "⚡ APIs" "🚀 SaaS Starters" "🗄️ Databases" "🛠️ Infrastructure")
+
+get_svc_field() {
+    local svc="$1"
+    local field="$2"
+    echo "$svc" | cut -d'|' -f"$field"
+}
+
+# ============================================================
+# PHASE 0: VM SCAN
+# ============================================================
+vm_scan() {
+    echo -e "${BLUE}${BOLD}🔍 Phase 0: VM Scan${NC}\n"
+
+    detect_os
+
+    local ram_total ram_used ram_available swap_total disk_total disk_avail
+    ram_total=$(free -m | awk '/^Mem:/{print $2}')
+    ram_used=$(free -m | awk '/^Mem:/{print $3}')
+    ram_available=$(free -m | awk '/^Mem:/{print $7}')
+    swap_total=$(free -m | awk '/^Swap:/{print $2}')
+    disk_total=$(df -h / | awk 'NR==2{print $2}')
+    disk_avail=$(df -h / | awk 'NR==2{print $4}')
+
+    local cpu_cores cpu_model
+    cpu_cores=$(nproc 2>/dev/null || echo "?")
+    cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "Unknown")
+
+    local inet="No"
+    if ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+        inet="Yes"
+    fi
+
+    local ts_status="Not installed"
+    local ts_ip=""
+    if command -v tailscale &>/dev/null; then
+        ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+        if [[ -n "$ts_ip" ]]; then
+            ts_status="Connected ($ts_ip)"
         else
-            echo -e " ${YELLOW}Already installed${NC}"
+            ts_status="Installed (not connected)"
         fi
-        
-        # Authentication
-        echo -e "\n${CYAN}🔑 Tailscale Authentication${NC}"
-        echo -e "${CYAN}Choose how to authenticate:${NC}\n"
-        echo -e "${YELLOW}[1]${NC} ${BOLD}Auth Key${NC} - Pre-generated key ${GREEN}(Recommended for automation)${NC}"
-        echo -e "    ${CYAN}→${NC} Get key from: https://login.tailscale.com/admin/settings/keys"
-        echo -e "    ${CYAN}→${NC} Best for unattended setup\n"
-        
-        echo -e "${YELLOW}[2]${NC} ${BOLD}OAuth${NC} - Browser login ${BLUE}(Interactive)${NC}"
-        echo -e "    ${CYAN}→${NC} Opens browser for authentication"
-        echo -e "    ${CYAN}→${NC} Requires active session\n"
-        
-        echo -e "${YELLOW}[3]${NC} ${BOLD}Skip${NC} - Configure later"
-        echo -e "    ${CYAN}→${NC} You can run: sudo tailscale up\n"
-        
-        while true; do
-            read -p "$(echo -e "${BOLD}Your choice [1-3]:${NC} ")" choice
-            case $choice in
-                1)
-                    echo ""
-                    read -p "$(echo -e "${BOLD}Enter auth key:${NC} ")" authkey
-                    if [[ -n "$authkey" ]]; then
-                        sudo tailscale up --authkey="$authkey" &>> "$LOG_FILE"
-                        local ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
-                        print_success "Authenticated with auth key"
-                        if [[ -n "$ts_ip" ]]; then
-                            print_success "Tailscale IP: $ts_ip"
-                        fi
-                    else
-                        print_error "No auth key provided"
-                    fi
+    fi
+
+    local podman_status="Not installed"
+    local containers_running=0
+    if command -v podman &>/dev/null; then
+        podman_status="Installed ($(podman --version 2>/dev/null | awk '{print $3}'))"
+        containers_running=$(podman ps -q 2>/dev/null | wc -l)
+    fi
+
+    echo -e "   ${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "   ${CYAN}║${NC}              ${BOLD}📊 VM Specifications${NC}                   ${CYAN}║${NC}"
+    echo -e "   ${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
+    printf "   ${CYAN}║${NC}  OS:          %-38s ${CYAN}║${NC}\n" "$OS_PRETTY"
+    printf "   ${CYAN}║${NC}  CPU:         %-38s ${CYAN}║${NC}\n" "${cpu_cores} cores — ${cpu_model:0:30}"
+    printf "   ${CYAN}║${NC}  RAM:         %-38s ${CYAN}║${NC}\n" "${ram_total} MB total, ${ram_available} MB available"
+    printf "   ${CYAN}║${NC}  Swap:        %-38s ${CYAN}║${NC}\n" "${swap_total} MB"
+    printf "   ${CYAN}║${NC}  Disk:        %-38s ${CYAN}║${NC}\n" "${disk_total} total, ${disk_avail} available"
+    printf "   ${CYAN}║${NC}  Internet:    %-38s ${CYAN}║${NC}\n" "$inet"
+    printf "   ${CYAN}║${NC}  Tailscale:   %-38s ${CYAN}║${NC}\n" "$ts_status"
+    printf "   ${CYAN}║${NC}  Podman:      %-38s ${CYAN}║${NC}\n" "$podman_status"
+    printf "   ${CYAN}║${NC}  Containers:  %-38s ${CYAN}║${NC}\n" "${containers_running} running"
+    echo -e "   ${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if [[ "$inet" == "No" ]]; then
+        print_error "No internet connectivity. Cannot proceed."
+        exit 1
+    fi
+
+    if [[ $ram_total -lt 400 ]]; then
+        print_warning "Very low RAM ($ram_total MB). Performance may be poor."
+    fi
+
+    # Store for later use
+    VM_RAM_AVAILABLE=$ram_available
+    VM_SWAP_TOTAL=$swap_total
+}
+
+# ============================================================
+# PHASE 1: SERVICE MENU
+# ============================================================
+show_services_menu() {
+    local avail_ram
+    avail_ram=$(get_available_ram)
+    local used_ram
+    used_ram=$(get_container_ram_used)
+    local free_ram=$((avail_ram - used_ram))
+
+    echo -e "${CYAN}${BOLD}📦 Service Catalog (25 services)${NC}\n"
+    echo -e "${DIM}   Available RAM: ${NC}${GREEN}${free_ram} MB${NC}${DIM} (${avail_ram} total - ${used_ram} used)${NC}\n"
+
+    local last_cat=""
+    for svc in "${SERVICES[@]}"; do
+        local snum=$(get_svc_field "$svc" 1)
+        local sname=$(get_svc_field "$svc" 3)
+        local sram=$(get_svc_field "$svc" 4)
+        local scat=$(get_svc_field "$svc" 5)
+        local sport=$(get_svc_field "$svc" 7)
+
+        # Print category header on change
+        if [[ "$scat" != "$last_cat" ]]; then
+            local cat_label=""
+            for i in "${!CATEGORY_NAMES[@]}"; do
+                if [[ "${CATEGORY_NAMES[$i]}" == "$scat" ]]; then
+                    cat_label="${CATEGORY_LABELS[$i]}"
                     break
-                    ;;
-                2)
-                    echo ""
-                    print_info "Opening browser for authentication..."
-                    sudo tailscale up
-                    local ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
-                    print_success "Authenticated via OAuth"
-                    if [[ -n "$ts_ip" ]]; then
-                        print_success "Tailscale IP: $ts_ip"
-                    fi
-                    break
-                    ;;
+                fi
+            done
+            echo -e "\n   ${BOLD}${cat_label}${NC}"
+            last_cat="$scat"
+        fi
+
+        # Color-code RAM fit
+        local color="${GREEN}"
+        [[ $sram -gt $free_ram ]] && color="${RED}"
+        [[ $sram -gt $((free_ram / 2)) ]] && [[ $sram -le $free_ram ]] && color="${YELLOW}"
+
+        local port_info=""
+        if [[ "$sport" != "0" ]]; then
+            port_info=":${sport}"
+        fi
+
+        printf "   ${YELLOW}[%2d]${NC} %-40s ${color}~%3dMB${NC} ${DIM}%s${NC}\n" \
+            "$snum" "$sname" "$sram" "$port_info"
+    done
+
+    echo ""
+    echo -e "   ${YELLOW}[ 0]${NC} ${BOLD}🔙 Done / Cancel${NC}\n"
+    echo -e "${DIM}   Color: ${GREEN}●${NC}${DIM} Fits  ${YELLOW}●${NC}${DIM} Tight  ${RED}●${NC}${DIM} Needs swap${NC}\n"
+
+    echo -e "${DIM}   Example packs:${NC}"
+    echo -e "   ${DIM}• Blog + Monitor:       1, 21        (~95 MB)${NC}"
+    echo -e "   ${DIM}• Full-stack Bot:       5, 16, 21    (~150 MB)${NC}"
+    echo -e "   ${DIM}• SaaS Starter:         14, 18, 21   (~205 MB)${NC}\n"
+}
+
+# ============================================================
+# PHASE 2: SERVICE SELECTION & INPUT COLLECTION
+# ============================================================
+
+# Parallel arrays for collected inputs
+SELECTED_IDS=()
+SEL_CONTAINER=()
+SEL_ACCESS=()
+SEL_DOMAIN=()
+SEL_TOKEN=()
+SEL_DB_NAME=()
+SEL_DB_PASS=()
+CUR_IDX=0
+
+select_services() {
+    show_services_menu
+
+    while true; do
+        read -p "$(echo -e "${BOLD}Enter service number (0 when done):${NC} ")" num
+
+        if [[ "$num" == "0" ]]; then
+            break
+        fi
+
+        if ! [[ "$num" =~ ^[0-9]+$ ]] || [[ $num -lt 1 ]] || [[ $num -gt ${#SERVICES[@]} ]]; then
+            echo -e "${RED}Invalid. Enter 1-${#SERVICES[@]} or 0.${NC}"
+            continue
+        fi
+
+        local svc="${SERVICES[$((num-1))]}"
+        local sid=$(get_svc_field "$svc" 2)
+        local sname=$(get_svc_field "$svc" 3)
+        local sram=$(get_svc_field "$svc" 4)
+
+        # Check duplicates
+        local dup=false
+        for s in "${SELECTED_IDS[@]}"; do
+            [[ "$s" == "$sid" ]] && dup=true
+        done
+        if $dup; then
+            echo -e "${YELLOW}Already selected: $sname${NC}"
+            continue
+        fi
+
+        # Check if already deployed
+        if command -v podman &>/dev/null && podman ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^${sid}$"; then
+            print_warning "$sname already deployed. Remove first: podman rm -f $sid"
+            continue
+        fi
+
+        SELECTED_IDS+=("$sid")
+        echo -e "${GREEN}✓${NC} Added: $sname (~${sram}MB)"
+    done
+
+    if [[ ${#SELECTED_IDS[@]} -eq 0 ]]; then
+        echo -e "\n${YELLOW}No services selected. Exiting.${NC}"
+        return 1
+    fi
+    return 0
+}
+
+collect_inputs() {
+    echo -e "\n${BLUE}${BOLD}📝 Phase 2: Input Collection${NC}"
+    echo -e "${DIM}   Collecting all inputs upfront before deployment.${NC}\n"
+
+    for i in "${!SELECTED_IDS[@]}"; do
+        CUR_IDX=$i
+        local sid="${SELECTED_IDS[$i]}"
+        local svc_entry=""
+        for svc in "${SERVICES[@]}"; do
+            [[ "$(get_svc_field "$svc" 2)" == "$sid" ]] && svc_entry="$svc"
+        done
+
+        local sname=$(get_svc_field "$svc_entry" 3)
+        local sport=$(get_svc_field "$svc_entry" 7)
+        local stype=$(get_svc_field "$svc_entry" 6)
+
+        echo -e "${CYAN}── $sname ──${NC}"
+
+        # Container name
+        local default_name="$sid"
+        read -p "$(echo -e "   Container name [${default_name}]: ")" cname
+        SEL_CONTAINER+=("${cname:-$default_name}")
+
+        # Bot tokens
+        SEL_TOKEN+=("")
+        SEL_DB_NAME+=("")
+        SEL_DB_PASS+=("")
+
+        case "$sid" in
+            telegram-bot-py|telegram-bot-node)
+                read -p "$(echo -e "   Telegram Bot Token: ")" token
+                SEL_TOKEN[$i]="${token:-YOUR_BOT_TOKEN_HERE}"
+                ;;
+            discord-bot-py|discord-bot-node)
+                read -p "$(echo -e "   Discord Bot Token: ")" token
+                SEL_TOKEN[$i]="${token:-YOUR_BOT_TOKEN_HERE}"
+                ;;
+            whatsapp-bot)
+                print_info "   WhatsApp: Scan QR after deployment (podman logs -f ${SEL_CONTAINER[$i]})"
+                ;;
+            combo-bot)
+                read -p "$(echo -e "   Telegram Bot Token: ")" tg_token
+                read -p "$(echo -e "   Discord Bot Token: ")" dc_token
+                SEL_TOKEN[$i]="${tg_token:-YOUR_TG_TOKEN}|${dc_token:-YOUR_DC_TOKEN}"
+                ;;
+            postgres|pg-redis)
+                read -p "$(echo -e "   Database name [mydb]: ")" dbname
+                SEL_DB_NAME[$i]="${dbname:-mydb}"
+                local gen_pass
+                gen_pass=$(generate_password 16)
+                read -p "$(echo -e "   Database password [auto: ${gen_pass:0:4}...]: ")" dbpass
+                SEL_DB_PASS[$i]="${dbpass:-$gen_pass}"
+                ;;
+        esac
+
+        # Access method (only for services with ports)
+        SEL_ACCESS+=("private")
+        SEL_DOMAIN+=("")
+        if [[ "$sport" != "0" ]]; then
+            echo -e "   ${BOLD}Access method:${NC}"
+            echo -e "   ${YELLOW}[1]${NC} Private (Tailscale only) ${GREEN}(Default)${NC}"
+            echo -e "   ${YELLOW}[2]${NC} Tailscale Funnel (free HTTPS)"
+            echo -e "   ${YELLOW}[3]${NC} Cloudflare Tunnel (custom domain)"
+            read -p "$(echo -e "   Choice [1]: ")" access
+            case "$access" in
+                2) SEL_ACCESS[$i]="funnel" ;;
                 3)
-                    print_warning "Tailscale authentication skipped"
-                    print_info "Run 'sudo tailscale up' later to authenticate"
-                    break
+                    SEL_ACCESS[$i]="cloudflare"
+                    read -p "$(echo -e "   Domain (e.g. app.example.com): ")" domain
+                    SEL_DOMAIN[$i]="${domain}"
                     ;;
-                *)
-                    echo -e "${RED}Please enter 1, 2, or 3${NC}"
-                    ;;
+                *) SEL_ACCESS[$i]="private" ;;
             esac
+        fi
+        echo ""
+    done
+}
+
+# ============================================================
+# PHASE 3: RAM BUDGET CHECK
+# ============================================================
+ram_budget_check() {
+    echo -e "${BLUE}${BOLD}📊 Phase 3: RAM Budget Check${NC}\n"
+
+    local total_ram_needed=0
+    for sid in "${SELECTED_IDS[@]}"; do
+        for svc in "${SERVICES[@]}"; do
+            if [[ "$(get_svc_field "$svc" 2)" == "$sid" ]]; then
+                local sram=$(get_svc_field "$svc" 4)
+                total_ram_needed=$((total_ram_needed + sram))
+            fi
+        done
+    done
+
+    local avail_ram
+    avail_ram=$(get_available_ram)
+    local used_ram
+    used_ram=$(get_container_ram_used)
+    local free_ram=$((avail_ram - used_ram))
+    local remaining=$((free_ram - total_ram_needed))
+    local swap_total
+    swap_total=$(free -m | awk '/^Swap:/{print $2}')
+
+    echo -e "   ┌──────────────────────────────────────────┐"
+    printf "   │ Free RAM:            %-20s │\n" "${free_ram} MB"
+    printf "   │ Selected total:      %-20s │\n" "${total_ram_needed} MB"
+    printf "   │ Remaining after:     %-20s │\n" "${remaining} MB"
+    printf "   │ Swap available:      %-20s │\n" "${swap_total} MB"
+    echo -e "   └──────────────────────────────────────────┘"
+
+    if [[ $remaining -gt 150 ]]; then
+        echo -e "   ${GREEN}✓ SAFE — Plenty of headroom.${NC}\n"
+        return 0
+    elif [[ $remaining -gt 0 ]]; then
+        echo -e "   ${YELLOW}⚠ TIGHT — Will work, but little headroom. Swap helps.${NC}\n"
+        return 0
+    else
+        echo -e "   ${RED}⚠ OVER by $((remaining * -1)) MB — Will rely heavily on swap.${NC}\n"
+        read -p "$(echo -e "${BOLD}Deploy anyway? [y/N]:${NC} ")" confirm
+        case "$confirm" in
+            [Yy]*) echo -e "${GREEN}✓${NC} Proceeding...\n"; return 0;;
+            *)     echo -e "${RED}Cancelled.${NC}"; return 1;;
+        esac
+    fi
+}
+
+# ============================================================
+# BASE SETUP: Swap, Podman, Tailscale, Cloudflared
+# ============================================================
+ensure_swap() {
+    if [ -f /swapfile ]; then
+        return 0
+    fi
+    echo -ne "   ${CYAN}→${NC} Creating 2GB swap..."
+    if command -v fallocate &>/dev/null; then
+        fallocate -l 2G /swapfile 2>>"$LOG_FILE" || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none 2>>"$LOG_FILE"
+    else
+        dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none 2>>"$LOG_FILE"
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile &>>"$LOG_FILE"
+    swapon /swapfile 2>>"$LOG_FILE" || true
+    if ! grep -q '/swapfile' /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab > /dev/null
+    fi
+    echo -e " ${GREEN}✓${NC}"
+}
+
+ensure_podman() {
+    if command -v podman &>/dev/null; then
+        return 0
+    fi
+    echo -ne "   ${CYAN}→${NC} Installing Podman..."
+    detect_os
+    apt-get update -qq &>>"$LOG_FILE"
+    case "$OS_ID" in
+        ubuntu|debian)
+            apt-get install -y -qq podman &>>"$LOG_FILE"
+            ;;
+        *)
+            apt-get install -y -qq podman &>>"$LOG_FILE" || {
+                print_error "Podman install failed. Install manually."
+                return 1
+            }
+            ;;
+    esac
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        loginctl enable-linger "$SUDO_USER" 2>/dev/null || true
+    fi
+    echo -e " ${GREEN}✓${NC}"
+}
+
+ensure_tailscale() {
+    if command -v tailscale &>/dev/null; then
+        return 0
+    fi
+    echo -ne "   ${CYAN}→${NC} Installing Tailscale..."
+    local tmp
+    tmp=$(mktemp /tmp/tailscale-install-XXXXXX)
+    trap "rm -f '$tmp'" RETURN
+    if curl -fsSL https://tailscale.com/install.sh -o "$tmp" 2>>"$LOG_FILE"; then
+        bash "$tmp" &>>"$LOG_FILE"
+        echo -e " ${GREEN}✓${NC}"
+    else
+        echo -e " ${RED}✗${NC}"
+        print_error "Tailscale download failed"
+    fi
+    rm -f "$tmp"
+}
+
+ensure_cloudflared() {
+    if command -v cloudflared &>/dev/null; then
+        return 0
+    fi
+    echo -ne "   ${CYAN}→${NC} Installing cloudflared..."
+    local arch
+    arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+    local tmp
+    tmp=$(mktemp /tmp/cloudflared-XXXXXX)
+    trap "rm -f '$tmp'" RETURN
+    if curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" -o "$tmp" 2>>"$LOG_FILE"; then
+        mv "$tmp" /usr/local/bin/cloudflared
+        chmod +x /usr/local/bin/cloudflared
+        echo -e " ${GREEN}✓${NC}"
+    else
+        echo -e " ${RED}✗${NC}"
+        print_error "cloudflared download failed"
+        rm -f "$tmp"
+    fi
+}
+
+# ============================================================
+#       SCAFFOLD TEMPLATES (14 service generators)
+# ============================================================
+
+scaffold_static_site() {
+    local dir="$PROJECTS_DIR/static-site"
+    mkdir -p "$dir"
+    if [ ! -f "$dir/index.html" ]; then
+        cat > "$dir/index.html" << 'SHTML'
+<!DOCTYPE html>
+<html><head><title>My Site</title>
+<style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:system-ui;display:flex;justify-content:center;align-items:center;min-height:100vh;background:linear-gradient(135deg,#0f172a,#1e293b);color:#e2e8f0;}
+.card{text-align:center;padding:3rem;}.card h1{font-size:2.5rem;margin-bottom:1rem;background:linear-gradient(to right,#38bdf8,#818cf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.card p{font-size:1.2rem;opacity:0.8;}</style>
+</head><body><div class="card"><h1>🚀 My Website</h1><p>Hosted on XecureNet</p><p>Edit ~/projects/static-site/index.html</p></div></body></html>
+SHTML
+    fi
+    echo "$dir"
+}
+
+scaffold_webapp_flask() {
+    local dir="$PROJECTS_DIR/webapp-flask"
+    mkdir -p "$dir/templates"
+
+    cat > "$dir/app.py" << 'PYEOF'
+from flask import Flask, render_template, jsonify
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+@app.route("/api/hello")
+def hello():
+    return jsonify(message="Hello from Flask on XecureNet!")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+PYEOF
+
+    cat > "$dir/templates/index.html" << 'HTMLEOF'
+<!DOCTYPE html>
+<html><head><title>My Web App</title>
+<style>body{font-family:system-ui;max-width:600px;margin:80px auto;text-align:center;}h1{color:#0ea5e9;}</style>
+</head><body>
+<h1>🚀 My Web App</h1>
+<p>Running on XecureNet with Flask!</p>
+<p>Edit <code>app.py</code> and <code>templates/</code> to build your app.</p>
+</body></html>
+HTMLEOF
+
+    cat > "$dir/requirements.txt" << 'EOF'
+flask==3.0.0
+gunicorn==21.2.0
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 5000
+CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
+EOF
+    echo "$dir"
+}
+
+scaffold_webapp_express() {
+    local dir="$PROJECTS_DIR/webapp-express"
+    mkdir -p "$dir/views"
+
+    cat > "$dir/index.js" << 'JSEOF'
+const express = require('express');
+const path = require('path');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+app.use(express.static('public'));
+
+app.get('/', (req, res) => res.render('index'));
+app.get('/api/hello', (req, res) => res.json({ message: 'Hello from Express on XecureNet!' }));
+
+app.listen(PORT, () => console.log(`🌍 Web app running on port ${PORT}`));
+JSEOF
+
+    cat > "$dir/views/index.ejs" << 'HTMLEOF'
+<!DOCTYPE html>
+<html><head><title>My Web App</title>
+<style>body{font-family:system-ui;max-width:600px;margin:80px auto;text-align:center;}h1{color:#0ea5e9;}</style>
+</head><body>
+<h1>🚀 My Web App</h1>
+<p>Running on XecureNet with Express!</p>
+<p>Edit <code>index.js</code> and <code>views/</code> to build your app.</p>
+</body></html>
+HTMLEOF
+
+    cat > "$dir/package.json" << 'EOF'
+{
+  "name": "webapp-express",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": { "express": "^4.18.0", "ejs": "^3.1.9" }
+}
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install --production
+COPY . .
+EXPOSE 3000
+CMD ["node", "index.js"]
+EOF
+    echo "$dir"
+}
+
+scaffold_telegram_bot_py() {
+    local dir="$PROJECTS_DIR/telegram-bot-py"
+    local token="${SEL_TOKEN[$CUR_IDX]:-YOUR_BOT_TOKEN_HERE}"
+    mkdir -p "$dir"
+
+    cat > "$dir/bot.py" << 'PYEOF'
+import os, logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 Hello! I'm your Telegram bot running on XecureNet!")
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"You said: {update.message.text}")
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception while handling update:", exc_info=context.error)
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    app.add_error_handler(error_handler)
+    logger.info("Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+    cat > "$dir/requirements.txt" << 'EOF'
+python-telegram-bot==21.0
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "bot.py"]
+EOF
+
+    cat > "$dir/.env" << EOF
+BOT_TOKEN=${token}
+EOF
+    echo "$dir"
+}
+
+scaffold_telegram_bot_node() {
+    local dir="$PROJECTS_DIR/telegram-bot-node"
+    local token="${SEL_TOKEN[$CUR_IDX]:-YOUR_BOT_TOKEN_HERE}"
+    mkdir -p "$dir"
+
+    cat > "$dir/bot.js" << 'JSEOF'
+const { Telegraf } = require('telegraf');
+const token = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
+const bot = new Telegraf(token);
+
+bot.start((ctx) => ctx.reply('🚀 Hello! I am your Telegram bot running on XecureNet!'));
+bot.help((ctx) => ctx.reply('Available commands: /start, /help'));
+bot.on('text', (ctx) => ctx.reply(`You said: ${ctx.message.text}`));
+
+bot.launch().then(() => console.log('Bot started!'));
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+JSEOF
+
+    cat > "$dir/package.json" << 'EOF'
+{
+  "name": "telegram-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "dependencies": { "telegraf": "^4.16.0" }
+}
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install --production
+COPY . .
+CMD ["node", "bot.js"]
+EOF
+
+    cat > "$dir/.env" << EOF
+BOT_TOKEN=${token}
+EOF
+    echo "$dir"
+}
+
+scaffold_discord_bot_py() {
+    local dir="$PROJECTS_DIR/discord-bot-py"
+    local token="${SEL_TOKEN[$CUR_IDX]:-YOUR_BOT_TOKEN_HERE}"
+    mkdir -p "$dir"
+
+    cat > "$dir/bot.py" << 'PYEOF'
+import os, discord
+from discord.ext import commands
+
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+intents = discord.Intents.default()
+intents.message_content = True  # Required for reading message content
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f"🚀 {bot.user} is online via XecureNet!")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash commands")
+    except Exception as e:
+        print(f"Slash sync failed: {e}")
+
+@bot.command()
+async def hello(ctx):
+    await ctx.send("Hello! I'm running on XecureNet! 🔒")
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f"Pong! {round(bot.latency * 1000)}ms")
+
+@bot.tree.command(name="hello", description="Say hello")
+async def slash_hello(interaction: discord.Interaction):
+    await interaction.response.send_message("Hello from XecureNet! 🔒")
+
+bot.run(TOKEN)
+PYEOF
+
+    cat > "$dir/requirements.txt" << 'EOF'
+discord.py==2.3.2
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "bot.py"]
+EOF
+
+    cat > "$dir/.env" << EOF
+BOT_TOKEN=${token}
+EOF
+    echo "$dir"
+}
+
+scaffold_discord_bot_node() {
+    local dir="$PROJECTS_DIR/discord-bot-node"
+    local token="${SEL_TOKEN[$CUR_IDX]:-YOUR_BOT_TOKEN_HERE}"
+    mkdir -p "$dir"
+
+    cat > "$dir/bot.js" << 'JSEOF'
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
+const client = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+});
+
+client.once('ready', async () => {
+    console.log(`🚀 ${client.user.tag} is online via XecureNet!`);
+    const commands = [new SlashCommandBuilder().setName('hello').setDescription('Say hello')];
+    const rest = new REST().setToken(TOKEN);
+    try {
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log('Slash commands registered');
+    } catch (e) { console.error('Slash registration failed:', e); }
+});
+
+client.on('messageCreate', (msg) => {
+    if (msg.author.bot) return;
+    if (msg.content === '!hello') msg.reply('Hello! Running on XecureNet! 🔒');
+    if (msg.content === '!ping') msg.reply(`Pong! ${client.ws.ping}ms`);
+});
+
+client.on('interactionCreate', async (i) => {
+    if (!i.isChatInputCommand()) return;
+    if (i.commandName === 'hello') await i.reply('Hello from XecureNet! 🔒');
+});
+
+client.login(TOKEN);
+JSEOF
+
+    cat > "$dir/package.json" << 'EOF'
+{
+  "name": "discord-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "dependencies": { "discord.js": "^14.14.0" }
+}
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install --production
+COPY . .
+CMD ["node", "bot.js"]
+EOF
+
+    cat > "$dir/.env" << EOF
+BOT_TOKEN=${token}
+EOF
+    echo "$dir"
+}
+
+scaffold_whatsapp_bot() {
+    local dir="$PROJECTS_DIR/whatsapp-bot"
+    mkdir -p "$dir"
+
+    cat > "$dir/bot.js" << 'JSEOF'
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const pino = require('pino');
+
+async function startBot() {
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    const sock = makeWASocket({
+        auth: state,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: true
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) setTimeout(() => startBot(), 3000);
+        } else if (connection === 'open') {
+            console.log('🚀 WhatsApp Bot connected via XecureNet!');
+        }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        for (const msg of messages) {
+            if (!msg.message || msg.key.fromMe) continue;
+            const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+            if (text.toLowerCase() === 'hi' || text.toLowerCase() === 'hello') {
+                await sock.sendMessage(msg.key.remoteJid, { text: '🤖 Hello! I am your WhatsApp bot running on XecureNet!' });
+            }
+        }
+    });
+}
+
+startBot();
+JSEOF
+
+    cat > "$dir/package.json" << 'EOF'
+{
+  "name": "whatsapp-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.6.0",
+    "pino": "^8.17.0"
+  }
+}
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install --production
+COPY . .
+CMD ["node", "bot.js"]
+EOF
+    echo "$dir"
+}
+
+scaffold_combo_bot() {
+    local dir="$PROJECTS_DIR/combo-bot"
+    local tokens="${SEL_TOKEN[$CUR_IDX]:-YOUR_TG_TOKEN|YOUR_DC_TOKEN}"
+    local tg_token="${tokens%%|*}"
+    local dc_token="${tokens##*|}"
+    mkdir -p "$dir"
+
+    cat > "$dir/bot.py" << 'PYEOF'
+import os, asyncio, logging, discord
+from discord.ext import commands
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TG_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TG_TOKEN")
+DC_TOKEN = os.getenv("DC_BOT_TOKEN", "YOUR_DC_TOKEN")
+
+# --- Telegram Bot ---
+async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 Hello from Combo Bot (Telegram)!")
+
+# --- Discord Bot ---
+intents = discord.Intents.default()
+intents.message_content = True
+dc_bot = commands.Bot(command_prefix="!", intents=intents)
+
+@dc_bot.event
+async def on_ready():
+    logger.info(f"Discord: {dc_bot.user} online!")
+
+@dc_bot.command()
+async def hello(ctx):
+    await ctx.send("🚀 Hello from Combo Bot (Discord)!")
+
+async def run_all():
+    tg_app = Application.builder().token(TG_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", tg_start))
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling()
+    logger.info("Telegram bot started!")
+
+    await dc_bot.start(DC_TOKEN)
+
+async def main():
+    try:
+        await run_all()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    asyncio.run(main())
+PYEOF
+
+    cat > "$dir/requirements.txt" << 'EOF'
+python-telegram-bot==21.0
+discord.py==2.3.2
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "bot.py"]
+EOF
+
+    cat > "$dir/.env" << EOF
+TG_BOT_TOKEN=${tg_token}
+DC_BOT_TOKEN=${dc_token}
+EOF
+    echo "$dir"
+}
+
+scaffold_api_fastapi() {
+    local dir="$PROJECTS_DIR/api-fastapi"
+    mkdir -p "$dir"
+
+    cat > "$dir/main.py" << 'PYEOF'
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI(title="My API", description="API running on XecureNet")
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+class Item(BaseModel):
+    name: str
+    price: float
+
+items = {}
+
+@app.get("/")
+def root():
+    return {"message": "🚀 API is live on XecureNet!", "docs": "/docs"}
+
+@app.get("/items")
+def get_items():
+    return items
+
+@app.post("/items/{item_id}")
+def create_item(item_id: int, item: Item):
+    items[item_id] = item
+    return {"id": item_id, **item.model_dump()}
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+PYEOF
+
+    cat > "$dir/requirements.txt" << 'EOF'
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+    echo "$dir"
+}
+
+scaffold_api_express() {
+    local dir="$PROJECTS_DIR/api-express"
+    mkdir -p "$dir"
+
+    cat > "$dir/index.js" << 'JSEOF'
+const express = require('express');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors());
+app.use(express.json());
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+
+let items = {};
+
+app.get('/', (req, res) => res.json({ message: '🚀 API is live on XecureNet!', docs: '/api/items' }));
+app.get('/api/items', (req, res) => res.json(items));
+app.post('/api/items/:id', (req, res) => {
+    items[req.params.id] = req.body;
+    res.json({ id: req.params.id, ...req.body });
+});
+app.get('/health', (req, res) => res.json({ status: 'healthy' }));
+
+app.listen(PORT, () => console.log(`🚀 API running on port ${PORT}`));
+JSEOF
+
+    cat > "$dir/package.json" << 'EOF'
+{
+  "name": "api-express",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": { "express": "^4.18.0", "cors": "^2.8.5", "express-rate-limit": "^7.1.0" }
+}
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install --production
+COPY . .
+EXPOSE 3001
+CMD ["node", "index.js"]
+EOF
+    echo "$dir"
+}
+
+scaffold_api_graphql() {
+    local dir="$PROJECTS_DIR/api-graphql"
+    mkdir -p "$dir"
+
+    cat > "$dir/index.js" << 'JSEOF'
+const { ApolloServer } = require('@apollo/server');
+const { startStandaloneServer } = require('@apollo/server/standalone');
+
+const typeDefs = `#graphql
+  type Item { id: ID!, name: String!, price: Float! }
+  type Query { items: [Item!]!, item(id: ID!): Item, health: String! }
+  type Mutation { addItem(name: String!, price: Float!): Item! }
+`;
+
+let items = [];
+let nextId = 1;
+
+const resolvers = {
+    Query: {
+        items: () => items,
+        item: (_, { id }) => items.find(i => i.id === id),
+        health: () => "healthy"
+    },
+    Mutation: {
+        addItem: (_, { name, price }) => {
+            const item = { id: String(nextId++), name, price };
+            items.push(item);
+            return item;
+        }
+    }
+};
+
+const server = new ApolloServer({ typeDefs, resolvers });
+startStandaloneServer(server, { listen: { port: 4000 } })
+    .then(({ url }) => console.log(`🚀 GraphQL API at ${url}`));
+JSEOF
+
+    cat > "$dir/package.json" << 'EOF'
+{
+  "name": "api-graphql",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": { "@apollo/server": "^4.10.0" }
+}
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install --production
+COPY . .
+EXPOSE 4000
+CMD ["node", "index.js"]
+EOF
+    echo "$dir"
+}
+
+scaffold_mini_saas_py() {
+    local dir="$PROJECTS_DIR/mini-saas-py"
+    mkdir -p "$dir"
+
+    cat > "$dir/main.py" << 'PYEOF'
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import sqlite3, hashlib, os, secrets
+
+app = FastAPI(title="Mini SaaS", description="Full-stack SaaS starter on XecureNet")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+DB = "/data/app.db"
+
+def get_db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT, salt TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, done BOOLEAN DEFAULT 0)")
+    return conn
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000).hex()
+    return hashed, salt
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class ItemCreate(BaseModel):
+    title: str
+
+@app.post("/api/register")
+def register(user: UserCreate):
+    db = get_db()
+    hashed, salt = hash_password(user.password)
+    try:
+        db.execute("INSERT INTO users (email, password, salt) VALUES (?, ?, ?)", (user.email, hashed, salt))
+        db.commit()
+        return {"message": "Registered!"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "Email already exists")
+
+@app.post("/api/items")
+def create_item(item: ItemCreate):
+    db = get_db()
+    db.execute("INSERT INTO items (user_id, title) VALUES (1, ?)", (item.title,))
+    db.commit()
+    return {"message": "Created!"}
+
+@app.get("/api/items")
+def list_items():
+    db = get_db()
+    rows = db.execute("SELECT * FROM items").fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/")
+def root():
+    return {"message": "🚀 Mini SaaS running on XecureNet!", "docs": "/docs"}
+PYEOF
+
+    cat > "$dir/requirements.txt" << 'EOF'
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+    echo "$dir"
+}
+
+scaffold_mini_saas_node() {
+    local dir="$PROJECTS_DIR/mini-saas-node"
+    mkdir -p "$dir"
+
+    cat > "$dir/index.js" << 'JSEOF'
+const express = require('express');
+const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+const app = express();
+const PORT = process.env.PORT || 3002;
+
+app.use(express.json());
+const db = new Database('/data/app.db');
+db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT)");
+db.exec("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, done INTEGER DEFAULT 0)");
+
+app.get('/', (req, res) => res.json({ message: '🚀 Mini SaaS running on XecureNet!', endpoints: ['/api/register', '/api/items'] }));
+
+app.post('/api/register', async (req, res) => {
+    const { email, password } = req.body;
+    const hashed = await bcrypt.hash(password, 10);
+    try { db.prepare("INSERT INTO users (email, password) VALUES (?, ?)").run(email, hashed); res.json({ message: 'Registered!' }); }
+    catch (e) { res.status(400).json({ error: 'Email already exists' }); }
+});
+
+app.post('/api/items', (req, res) => {
+    db.prepare("INSERT INTO items (user_id, title) VALUES (1, ?)").run(req.body.title);
+    res.json({ message: 'Created!' });
+});
+
+app.get('/api/items', (req, res) => {
+    res.json(db.prepare("SELECT * FROM items").all());
+});
+
+app.listen(PORT, () => console.log(`🚀 Mini SaaS running on port ${PORT}`));
+JSEOF
+
+    cat > "$dir/package.json" << 'EOF'
+{
+  "name": "mini-saas",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": { "express": "^4.18.0", "better-sqlite3": "^9.4.0", "bcryptjs": "^2.4.3" }
+}
+EOF
+
+    cat > "$dir/Dockerfile" << 'EOF'
+FROM node:20-alpine
+RUN apk add --no-cache python3 make g++
+WORKDIR /app
+COPY package.json .
+RUN npm install --production
+COPY . .
+EXPOSE 3002
+CMD ["node", "index.js"]
+EOF
+    echo "$dir"
+}
+
+# ============================================================
+# PHASE 4: DEPLOY ENGINE
+# ============================================================
+deploy_single_service() {
+    local idx="$1"
+    local sid="${SELECTED_IDS[$idx]}"
+    CUR_IDX=$idx
+
+    local svc_entry=""
+    for svc in "${SERVICES[@]}"; do
+        [[ "$(get_svc_field "$svc" 2)" == "$sid" ]] && svc_entry="$svc"
+    done
+
+    local sname=$(get_svc_field "$svc_entry" 3)
+    local sram=$(get_svc_field "$svc_entry" 4)
+    local stype=$(get_svc_field "$svc_entry" 6)
+    local sport=$(get_svc_field "$svc_entry" 7)
+    local cname="${SEL_CONTAINER[$idx]}"
+    local mem_limit="${sram}m"
+    local mem_swap="$((sram * 2))m"
+
+    echo -e "\n${CYAN}🚀 Deploying: $sname${NC} (as ${BOLD}$cname${NC})"
+
+    # Ensure projects dir exists
+    mkdir -p "$PROJECTS_DIR"
+    [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]] && chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$PROJECTS_DIR"
+
+    case "$sid" in
+        # ─── READY-TO-DEPLOY (pre-built images) ───
+        static-site)
+            local webroot
+            webroot=$(scaffold_static_site)
+            echo -ne "   ${CYAN}→${NC} Starting Nginx..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --label io.containers.autoupdate=registry \
+                -v "$webroot:/usr/share/nginx/html:ro" \
+                -p "${sport}:80" \
+                docker.io/library/nginx:1-alpine &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Static site on port $sport"
+            print_info "Files: $webroot/"
+            ;;
+
+        filebrowser)
+            mkdir -p "$PROJECTS_DIR/filebrowser-data"
+            echo -ne "   ${CYAN}→${NC} Starting FileBrowser..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$PROJECTS_DIR:/srv:ro" \
+                -v "$PROJECTS_DIR/filebrowser-data:/database" \
+                -p "${sport}:80" \
+                docker.io/filebrowser/filebrowser:latest &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "FileBrowser on port $sport (user: admin, pass: admin)"
+            ;;
+
+        uptime-kuma)
+            mkdir -p "$PROJECTS_DIR/uptime-kuma-data"
+            echo -ne "   ${CYAN}→${NC} Starting Uptime Kuma..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --label io.containers.autoupdate=registry \
+                -v "$PROJECTS_DIR/uptime-kuma-data:/app/data" \
+                -p "${sport}:3001" \
+                docker.io/louislam/uptime-kuma:1 &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Uptime Kuma on port $sport"
+            ;;
+
+        gitea)
+            mkdir -p "$PROJECTS_DIR/gitea-data"
+            echo -ne "   ${CYAN}→${NC} Starting Gitea..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --label io.containers.autoupdate=registry \
+                -v "$PROJECTS_DIR/gitea-data:/data" \
+                -p "${sport}:3000" \
+                docker.io/gitea/gitea:latest-rootless &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Gitea on port $sport"
+            ;;
+
+        postgres)
+            local dbname="${SEL_DB_NAME[$idx]:-mydb}"
+            local dbpass="${SEL_DB_PASS[$idx]:-xecurenet123}"
+            mkdir -p "$PROJECTS_DIR/postgres-data"
+            echo -ne "   ${CYAN}→${NC} Starting PostgreSQL..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -e POSTGRES_PASSWORD="$dbpass" \
+                -e POSTGRES_DB="$dbname" \
+                -v "$PROJECTS_DIR/postgres-data:/var/lib/postgresql/data" \
+                -p "127.0.0.1:${sport}:5432" \
+                docker.io/library/postgres:16-alpine &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "PostgreSQL on 127.0.0.1:$sport (db: $dbname)"
+            ;;
+
+        redis)
+            mkdir -p "$PROJECTS_DIR/redis-data"
+            echo -ne "   ${CYAN}→${NC} Starting Redis..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$PROJECTS_DIR/redis-data:/data" \
+                -p "127.0.0.1:${sport}:6379" \
+                docker.io/library/redis:7-alpine &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Redis on 127.0.0.1:$sport"
+            ;;
+
+        pg-redis)
+            local dbname="${SEL_DB_NAME[$idx]:-mydb}"
+            local dbpass="${SEL_DB_PASS[$idx]:-xecurenet123}"
+            mkdir -p "$PROJECTS_DIR/postgres-data" "$PROJECTS_DIR/redis-data"
+            echo -ne "   ${CYAN}→${NC} Starting PostgreSQL..."
+            podman run -d --name "${cname}-pg" \
+                --restart=always --memory="30m" --memory-swap="60m" \
+                -e POSTGRES_PASSWORD="$dbpass" \
+                -e POSTGRES_DB="$dbname" \
+                -v "$PROJECTS_DIR/postgres-data:/var/lib/postgresql/data" \
+                -p "127.0.0.1:5432:5432" \
+                docker.io/library/postgres:16-alpine &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting Redis..."
+            podman run -d --name "${cname}-redis" \
+                --restart=always --memory="25m" --memory-swap="50m" \
+                -v "$PROJECTS_DIR/redis-data:/data" \
+                -p "127.0.0.1:6379:6379" \
+                docker.io/library/redis:7-alpine &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "PostgreSQL on 127.0.0.1:5432 + Redis on 127.0.0.1:6379"
+            ;;
+
+        vaultwarden)
+            mkdir -p "$PROJECTS_DIR/vaultwarden-data"
+            echo -ne "   ${CYAN}→${NC} Starting Vaultwarden..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$PROJECTS_DIR/vaultwarden-data:/data" \
+                -p "${sport}:80" \
+                docker.io/vaultwarden/server:latest &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Vaultwarden on port $sport"
+            ;;
+
+        privatebin)
+            mkdir -p "$PROJECTS_DIR/privatebin-data"
+            echo -ne "   ${CYAN}→${NC} Starting PrivateBin..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$PROJECTS_DIR/privatebin-data:/srv/data" \
+                -p "${sport}:8080" \
+                docker.io/privatebin/nginx-fpm-alpine:latest &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "PrivateBin on port $sport"
+            ;;
+
+        n8n)
+            mkdir -p "$PROJECTS_DIR/n8n-data"
+            echo -ne "   ${CYAN}→${NC} Starting n8n..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$PROJECTS_DIR/n8n-data:/home/node/.n8n" \
+                -p "${sport}:5678" \
+                docker.io/n8nio/n8n:latest &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "n8n on port $sport"
+            ;;
+
+        cron-jobs)
+            echo -ne "   ${CYAN}→${NC} Starting Ofelia..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v /run/podman/podman.sock:/var/run/docker.sock:ro \
+                docker.io/mcuadros/ofelia:latest daemon --docker &>>"$LOG_FILE" || {
+                    print_warning "Ofelia requires podman socket"
+                }
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Ofelia cron runner deployed"
+            ;;
+
+        dashy)
+            echo -ne "   ${CYAN}→${NC} Starting Dashy..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -p "${sport}:8080" \
+                docker.io/lissy93/dashy:latest &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Dashy on port $sport"
+            ;;
+
+        # ─── SCAFFOLD SERVICES (build from template) ───
+        webapp-flask)
+            local dir
+            dir=$(scaffold_webapp_flask)
+            echo -ne "   ${CYAN}→${NC} Building Flask app..."
+            podman build -t webapp-flask "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -p "${sport}:5000" \
+                webapp-flask &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Flask app on port $sport"
+            print_info "Project: $dir/"
+            ;;
+
+        webapp-express)
+            local dir
+            dir=$(scaffold_webapp_express)
+            echo -ne "   ${CYAN}→${NC} Building Express app..."
+            podman build -t webapp-express "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -p "${sport}:3000" \
+                webapp-express &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Express app on port $sport"
+            print_info "Project: $dir/"
+            ;;
+
+        telegram-bot-py)
+            local dir
+            dir=$(scaffold_telegram_bot_py)
+            echo -ne "   ${CYAN}→${NC} Building Telegram bot (Python)..."
+            podman build -t telegram-bot-py "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --env-file "$dir/.env" \
+                telegram-bot-py &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_info "Project: $dir/"
+            print_warning "Edit $dir/.env with your token, then: podman restart $cname"
+            ;;
+
+        telegram-bot-node)
+            local dir
+            dir=$(scaffold_telegram_bot_node)
+            echo -ne "   ${CYAN}→${NC} Building Telegram bot (Node)..."
+            podman build -t telegram-bot-node "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --env-file "$dir/.env" \
+                telegram-bot-node &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_info "Project: $dir/"
+            print_warning "Edit $dir/.env with your token, then: podman restart $cname"
+            ;;
+
+        discord-bot-py)
+            local dir
+            dir=$(scaffold_discord_bot_py)
+            echo -ne "   ${CYAN}→${NC} Building Discord bot (Python)..."
+            podman build -t discord-bot-py "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --env-file "$dir/.env" \
+                discord-bot-py &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_info "Project: $dir/"
+            print_warning "Edit $dir/.env with your token, then: podman restart $cname"
+            ;;
+
+        discord-bot-node)
+            local dir
+            dir=$(scaffold_discord_bot_node)
+            echo -ne "   ${CYAN}→${NC} Building Discord bot (Node)..."
+            podman build -t discord-bot-node "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --env-file "$dir/.env" \
+                discord-bot-node &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_info "Project: $dir/"
+            print_warning "Edit $dir/.env with your token, then: podman restart $cname"
+            ;;
+
+        whatsapp-bot)
+            local dir
+            dir=$(scaffold_whatsapp_bot)
+            echo -ne "   ${CYAN}→${NC} Building WhatsApp bot..."
+            podman build -t whatsapp-bot "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$dir/auth_info:/app/auth_info" \
+                whatsapp-bot &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_info "Scan QR: podman logs -f $cname"
+            ;;
+
+        combo-bot)
+            local dir
+            dir=$(scaffold_combo_bot)
+            echo -ne "   ${CYAN}→${NC} Building Combo bot..."
+            podman build -t combo-bot "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                --env-file "$dir/.env" \
+                combo-bot &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_info "Project: $dir/"
+            print_warning "Edit $dir/.env with your tokens, then: podman restart $cname"
+            ;;
+
+        api-fastapi)
+            local dir
+            dir=$(scaffold_api_fastapi)
+            echo -ne "   ${CYAN}→${NC} Building FastAPI..."
+            podman build -t api-fastapi "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -p "${sport}:8000" \
+                api-fastapi &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "FastAPI on port $sport (docs: /docs)"
+            print_info "Project: $dir/"
+            ;;
+
+        api-express)
+            local dir
+            dir=$(scaffold_api_express)
+            echo -ne "   ${CYAN}→${NC} Building Express API..."
+            podman build -t api-express "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -p "${sport}:3001" \
+                api-express &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Express API on port $sport"
+            print_info "Project: $dir/"
+            ;;
+
+        api-graphql)
+            local dir
+            dir=$(scaffold_api_graphql)
+            echo -ne "   ${CYAN}→${NC} Building GraphQL API..."
+            podman build -t api-graphql "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -p "${sport}:4000" \
+                api-graphql &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "GraphQL API on port $sport"
+            print_info "Project: $dir/"
+            ;;
+
+        mini-saas-py)
+            local dir
+            dir=$(scaffold_mini_saas_py)
+            mkdir -p "$PROJECTS_DIR/mini-saas-py-data"
+            echo -ne "   ${CYAN}→${NC} Building Mini SaaS (Python)..."
+            podman build -t mini-saas-py "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$PROJECTS_DIR/mini-saas-py-data:/data" \
+                -p "${sport}:8000" \
+                mini-saas-py &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Mini SaaS (Python) on port $sport (docs: /docs)"
+            print_info "Project: $dir/"
+            ;;
+
+        mini-saas-node)
+            local dir
+            dir=$(scaffold_mini_saas_node)
+            mkdir -p "$PROJECTS_DIR/mini-saas-node-data"
+            echo -ne "   ${CYAN}→${NC} Building Mini SaaS (Node)..."
+            podman build -t mini-saas-node "$dir" &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            echo -ne "   ${CYAN}→${NC} Starting container..."
+            podman run -d --name "$cname" \
+                --restart=always --memory="$mem_limit" --memory-swap="$mem_swap" \
+                -v "$PROJECTS_DIR/mini-saas-node-data:/data" \
+                -p "${sport}:3002" \
+                mini-saas-node &>>"$LOG_FILE"
+            echo -e " ${GREEN}✓${NC}"
+            print_success "Mini SaaS (Node) on port $sport"
+            print_info "Project: $dir/"
+            ;;
+
+        *)
+            print_error "No deploy handler for: $sid"
+            return 1
+            ;;
+    esac
+
+    # Register
+    echo "$sid|$cname|$(date -Iseconds)" >> "$DEPLOY_REGISTRY" 2>/dev/null
+
+    # Verify container is running
+    sleep 1
+    local cstatus
+    cstatus=$(podman inspect "$cname" --format "{{.State.Status}}" 2>/dev/null || echo "unknown")
+    if [[ "$cstatus" != "running" ]]; then
+        # For pg-redis combo, check both
+        if [[ "$sid" == "pg-redis" ]]; then
+            local pg_s redis_s
+            pg_s=$(podman inspect "${cname}-pg" --format "{{.State.Status}}" 2>/dev/null || echo "unknown")
+            redis_s=$(podman inspect "${cname}-redis" --format "{{.State.Status}}" 2>/dev/null || echo "unknown")
+            if [[ "$pg_s" != "running" ]] || [[ "$redis_s" != "running" ]]; then
+                print_warning "Container may not have started. Check: podman logs ${cname}-pg / ${cname}-redis"
+            fi
+        else
+            print_warning "Container status: $cstatus. Check: podman logs $cname"
+        fi
+    fi
+
+    return 0
+}
+
+# ============================================================
+# ACCESS SETUP (Tailscale Funnel / Cloudflare Tunnel / Private)
+# ============================================================
+setup_access() {
+    local idx="$1"
+    local sid="${SELECTED_IDS[$idx]}"
+    local cname="${SEL_CONTAINER[$idx]}"
+    local access="${SEL_ACCESS[$idx]}"
+    local domain="${SEL_DOMAIN[$idx]}"
+
+    local svc_entry=""
+    for svc in "${SERVICES[@]}"; do
+        [[ "$(get_svc_field "$svc" 2)" == "$sid" ]] && svc_entry="$svc"
+    done
+    local sport=$(get_svc_field "$svc_entry" 7)
+    local sname=$(get_svc_field "$svc_entry" 3)
+
+    # Skip no-port services
+    [[ "$sport" == "0" ]] && return 0
+
+    case "$access" in
+        funnel)
+            echo -ne "   ${CYAN}→${NC} Enabling Tailscale Funnel for $sname..."
+            if command -v tailscale &>/dev/null; then
+                tailscale funnel --bg "$sport" &>>"$LOG_FILE" && {
+                    echo -e " ${GREEN}✓${NC}"
+                    local hostname
+                    hostname=$(tailscale status --json 2>/dev/null | grep -o '"DNSName":"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\.$//')
+                    print_success "Public: https://${hostname}:${sport}"
+                } || {
+                    echo -e " ${RED}✗${NC}"
+                    print_error "Funnel failed. Enable at: Tailscale admin → DNS → Funnel"
+                }
+            else
+                echo -e " ${RED}✗${NC}"
+                print_error "Tailscale not installed"
+            fi
+            ;;
+
+        cloudflare)
+            echo -ne "   ${CYAN}→${NC} Setting up Cloudflare Tunnel for $sname..."
+            ensure_cloudflared
+            if command -v cloudflared &>/dev/null && [[ -n "$domain" ]]; then
+                cloudflared tunnel --url "http://localhost:$sport" --hostname "$domain" &>>"$LOG_FILE" &
+                echo -e " ${GREEN}✓${NC}"
+                print_success "Cloudflare Tunnel: $domain -> localhost:$sport"
+            else
+                echo -e " ${YELLOW}⚠${NC}"
+                print_warning "Run manually: cloudflared tunnel --url http://localhost:$sport"
+            fi
+            ;;
+
+        private|*)
+            local ts_ip
+            ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+            if [[ -n "$ts_ip" ]]; then
+                print_info "$sname: http://${ts_ip}:${sport} (Tailscale)"
+            else
+                print_info "$sname: http://localhost:${sport} (local only)"
+            fi
+            ;;
+    esac
+}
+
+# ============================================================
+# SYSTEMD SERVICE GENERATION (auto-start on reboot)
+# ============================================================
+create_systemd_service() {
+    local cname="$1"
+
+    # Only works on systemd systems with SUDO_USER
+    if [[ -z "${SUDO_USER:-}" ]]; then
+        return 0
+    fi
+
+    local uid
+    uid=$(id -u "$SUDO_USER" 2>/dev/null || return 0)
+    local systemd_dir="/etc/systemd/system"
+    local service_file="${systemd_dir}/podman-${cname}.service"
+
+    cat > "$service_file" << SVCEOF
+[Unit]
+Description=Podman container: ${cname}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+Restart=on-failure
+RestartSec=10
+ExecStart=/usr/bin/podman start ${cname}
+ExecStop=/usr/bin/podman stop -t 10 ${cname}
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    systemctl daemon-reload &>>"$LOG_FILE" || true
+    systemctl enable "podman-${cname}" &>>"$LOG_FILE" || true
+    log "Created systemd service: podman-${cname}"
+}
+
+# ============================================================
+# CLEANUP (prune images, fix permissions)
+# ============================================================
+run_cleanup() {
+    echo -e "\n${CYAN}🧹 Cleanup${NC}"
+
+    # Prune dangling images
+    echo -ne "   ${CYAN}→${NC} Pruning unused images..."
+    podman image prune -f &>>"$LOG_FILE" || true
+    echo -e " ${GREEN}✓${NC}"
+
+    # Fix permissions on projects dir
+    if [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
+        echo -ne "   ${CYAN}→${NC} Fixing file ownership..."
+        chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$PROJECTS_DIR" 2>/dev/null || true
+        chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$CONFIG_DIR" 2>/dev/null || true
+        echo -e " ${GREEN}✓${NC}"
+    fi
+
+    # Optimize kernel if not done
+    if ! grep -q "vm.swappiness=10" /etc/sysctl.conf 2>/dev/null; then
+        echo -ne "   ${CYAN}→${NC} Optimizing kernel..."
+        echo 'vm.swappiness=10' | tee -a /etc/sysctl.conf > /dev/null
+        echo 'vm.vfs_cache_pressure=50' | tee -a /etc/sysctl.conf > /dev/null
+        sysctl -p &>>"$LOG_FILE" || true
+        echo -e " ${GREEN}✓${NC}"
+    fi
+}
+
+# ============================================================
+# PHASE 5: SUMMARY CARD
+# ============================================================
+print_summary_card() {
+    echo -e "\n${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║${NC}            ${GREEN}${BOLD}✨ DEPLOYMENT COMPLETE! ✨${NC}                  ${GREEN}║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
+
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+
+    echo -e "${BLUE}📊 Deployed Services:${NC}\n"
+
+    for i in "${!SELECTED_IDS[@]}"; do
+        local sid="${SELECTED_IDS[$i]}"
+        local cname="${SEL_CONTAINER[$i]}"
+        local access="${SEL_ACCESS[$i]}"
+
+        local svc_entry=""
+        for svc in "${SERVICES[@]}"; do
+            [[ "$(get_svc_field "$svc" 2)" == "$sid" ]] && svc_entry="$svc"
+        done
+        local sname=$(get_svc_field "$svc_entry" 3)
+        local sport=$(get_svc_field "$svc_entry" 7)
+
+        # Status check
+        local cstatus
+        if [[ "$sid" == "pg-redis" ]]; then
+            local pg_s redis_s
+            pg_s=$(podman inspect "${cname}-pg" --format "{{.State.Status}}" 2>/dev/null || echo "?")
+            redis_s=$(podman inspect "${cname}-redis" --format "{{.State.Status}}" 2>/dev/null || echo "?")
+            cstatus="pg:${pg_s} redis:${redis_s}"
+        else
+            cstatus=$(podman inspect "$cname" --format "{{.State.Status}}" 2>/dev/null || echo "unknown")
+        fi
+
+        if [[ "$cstatus" == *"running"* ]]; then
+            echo -e "   ${GREEN}●${NC} ${BOLD}$sname${NC}"
+        else
+            echo -e "   ${RED}●${NC} ${BOLD}$sname${NC} ${RED}($cstatus)${NC}"
+        fi
+
+        echo -e "     Container: ${CYAN}$cname${NC}"
+        if [[ "$sport" != "0" ]]; then
+            if [[ -n "$ts_ip" ]]; then
+                echo -e "     URL:       ${CYAN}http://${ts_ip}:${sport}${NC}"
+            else
+                echo -e "     Port:      ${CYAN}${sport}${NC}"
+            fi
+        fi
+        echo -e "     Access:    ${access}"
+
+        # Show .env location for scaffold services
+        local env_file="$PROJECTS_DIR/${sid}/.env"
+        [[ -f "$env_file" ]] && echo -e "     .env:      ${DIM}$env_file${NC}"
+        echo ""
+    done
+
+    # Database credentials
+    local has_db=false
+    for i in "${!SELECTED_IDS[@]}"; do
+        if [[ -n "${SEL_DB_PASS[$i]:-}" ]] && [[ "${SEL_DB_PASS[$i]}" != "" ]]; then
+            has_db=true
+            break
+        fi
+    done
+    if $has_db; then
+        echo -e "${YELLOW}🔐 Database Credentials:${NC}\n"
+        for i in "${!SELECTED_IDS[@]}"; do
+            local sid="${SELECTED_IDS[$i]}"
+            if [[ -n "${SEL_DB_PASS[$i]:-}" ]] && [[ "${SEL_DB_PASS[$i]}" != "" ]]; then
+                echo -e "   ${BOLD}${sid}${NC}"
+                echo -e "     DB:       ${SEL_DB_NAME[$i]:-mydb}"
+                echo -e "     Password: ${YELLOW}${SEL_DB_PASS[$i]}${NC}"
+                echo -e "     ${RED}⚠ Save this password! It won't be shown again.${NC}\n"
+            fi
+        done
+    fi
+
+    echo -e "${BLUE}💡 Useful Commands:${NC}\n"
+    echo -e "   ${CYAN}xecurenet status${NC}           — Check all services"
+    echo -e "   ${CYAN}podman logs <name>${NC}         — View service logs"
+    echo -e "   ${CYAN}podman restart <name>${NC}      — Restart a service"
+    echo -e "   ${CYAN}sudo xecurenet deploy${NC}      — Deploy more services"
+    echo -e "   ${CYAN}sudo xecurenet remove${NC}      — Remove a service"
+    echo ""
+    echo -e "${BLUE}📝 Logs:${NC} $LOG_FILE"
+    echo -e "${BLUE}📂 Projects:${NC} $PROJECTS_DIR/"
+    echo ""
+}
+
+# ============================================================
+# AGENT TRAINING CARD (copy-ready for new Claude sessions)
+# ============================================================
+print_agent_training_card() {
+    echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${MAGENTA}║${NC}           ${MAGENTA}${BOLD}🤖 Agent Training Card${NC}                      ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA}╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${MAGENTA}║${NC} Copy this to a new Claude/ChatGPT session for context  ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}\n"
+
+    echo -e "${DIM}───── COPY BELOW THIS LINE ─────${NC}\n"
+
+    echo "I have a VM set up with XecureNet v${VERSION}."
+    echo "OS: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '"' || echo 'Linux')"
+    echo "RAM: $(free -m | awk '/^Mem:/{print $2}') MB total"
+    echo "Swap: $(free -m | awk '/^Swap:/{print $2}') MB"
+    echo ""
+    echo "Deployed services:"
+    for i in "${!SELECTED_IDS[@]}"; do
+        local sid="${SELECTED_IDS[$i]}"
+        local cname="${SEL_CONTAINER[$i]}"
+        local svc_entry=""
+        for svc in "${SERVICES[@]}"; do
+            [[ "$(get_svc_field "$svc" 2)" == "$sid" ]] && svc_entry="$svc"
+        done
+        local sport=$(get_svc_field "$svc_entry" 7)
+        echo "  - ${sid} (container: ${cname}, port: ${sport})"
+    done
+    echo ""
+    echo "Container runtime: Podman (rootless)"
+    echo "Network: Tailscale"
+    echo "Projects dir: $PROJECTS_DIR"
+    echo "Config dir: $CONFIG_DIR"
+    echo ""
+
+    echo -e "\n${DIM}───── COPY ABOVE THIS LINE ─────${NC}\n"
+}
+
+# ============================================================
+# SHOW STATUS
+# ============================================================
+show_status() {
+    show_banner
+
+    local ram_total ram_used ram_available swap_total swap_used
+    ram_total=$(free -m | awk '/^Mem:/{print $2}')
+    ram_used=$(free -m | awk '/^Mem:/{print $3}')
+    ram_available=$(free -m | awk '/^Mem:/{print $7}')
+    swap_total=$(free -h | awk '/^Swap:/{print $2}')
+    swap_used=$(free -h | awk '/^Swap:/{print $3}')
+
+    local tailscale_ip="Not installed"
+    local tailscale_status="not installed"
+    if command -v tailscale &>/dev/null; then
+        tailscale_ip=$(tailscale ip -4 2>/dev/null || echo "Not configured")
+        tailscale_status=$(systemctl is-active tailscaled 2>/dev/null || echo "inactive")
+    fi
+
+    local podman_status="Not installed"
+    local containers=0
+    if command -v podman &>/dev/null; then
+        podman_status="Active"
+        containers=$(podman ps -q 2>/dev/null | wc -l)
+    fi
+
+    echo -e "${BLUE}📊 System Status${NC}\n"
+
+    echo -e "   ${CYAN}Memory:${NC}"
+    echo "   ├─ Total:     ${ram_total} MB"
+    echo "   ├─ Used:      ${ram_used} MB"
+    echo -e "   └─ Available: ${GREEN}${ram_available} MB${NC}"
+    echo ""
+
+    echo -e "   ${CYAN}Swap:${NC}"
+    echo "   ├─ Total: ${swap_total}"
+    echo "   └─ Used:  ${swap_used}"
+    echo ""
+
+    echo -e "   ${CYAN}Network:${NC}"
+    if [[ "$tailscale_ip" != "Not configured" ]] && [[ "$tailscale_ip" != "Not installed" ]]; then
+        echo -e "   └─ Tailscale IP: ${GREEN}${tailscale_ip}${NC}"
+    else
+        echo -e "   └─ Tailscale: ${YELLOW}${tailscale_ip}${NC}"
+    fi
+    echo ""
+
+    echo -e "   ${CYAN}Services:${NC}"
+    echo -e "   ├─ Podman:        ${GREEN}✓${NC} $podman_status"
+    if [[ "$tailscale_status" == "active" ]]; then
+        echo -e "   ├─ Tailscale:     ${GREEN}✓${NC} Connected"
+    else
+        echo -e "   ├─ Tailscale:     ${YELLOW}⚠${NC} $tailscale_status"
+    fi
+    echo -e "   └─ Containers:    ${GREEN}${containers} running${NC}"
+    echo ""
+
+    if [[ $containers -gt 0 ]] && command -v podman &>/dev/null; then
+        echo -e "   ${CYAN}Deployed Containers:${NC}\n"
+        podman ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | while IFS= read -r line; do
+            echo "   $line"
+        done
+        echo ""
+
+        echo -e "   ${CYAN}Container Memory Usage:${NC}\n"
+        podman stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}" 2>/dev/null | while IFS= read -r line; do
+            echo "   $line"
         done
         echo ""
     fi
 }
 
-# VM Optimization
-optimize_vm() {
-    echo -e "${YELLOW}⚙️  VM Optimization${NC}\n"
-    
-    # Step 1: Remove bloat
-    if ask_permission "Remove unnecessary packages?" "Removes unattended-upgrades, chrony, and other bloat. Saves ~100MB RAM"; then
-        echo -ne "   ${CYAN}[1/6]${NC} Removing bloat..."
-        sudo systemctl stop unattended-upgrades chrony 2>/dev/null || true
-        sudo systemctl disable unattended-upgrades chrony 2>/dev/null || true
-        sudo apt purge -y unattended-upgrades chrony &>> "$LOG_FILE"
-        sudo apt autoremove -y &>> "$LOG_FILE"
-        echo -e " ${GREEN}✓${NC} (saved ~100MB)"
-    fi
-    
-    # Step 2: Install Podman
-    if ask_permission "Install Podman?" "Lightweight container runtime. Uses 30MB RAM vs Docker's 150MB. Rootless by default"; then
-        echo -ne "   ${CYAN}[2/6]${NC} Installing Podman..."
-        if ! command -v podman &> /dev/null; then
-            echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_12/ /" | sudo tee /etc/apt/sources.list.d/podman.list > /dev/null
-            curl -fsSL https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/Debian_12/Release.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/podman.gpg
-            sudo apt update &>> "$LOG_FILE"
-            sudo apt install -y podman &>> "$LOG_FILE"
-            loginctl enable-linger $SUDO_USER 2>/dev/null || true
-            echo -e " ${GREEN}✓${NC} (30MB)"
-        else
-            echo -e " ${YELLOW}Already installed${NC}"
-        fi
-    fi
-    
-    # Step 3: Create swap
-    if ask_permission "Create 2GB swap file?" "Swap acts as overflow RAM. Prevents OOM kills. Uses disk space"; then
-        echo -ne "   ${CYAN}[3/6]${NC} Creating 2GB swap..."
-        if [ ! -f /swapfile ]; then
-            sudo fallocate -l 2G /swapfile
-            sudo chmod 600 /swapfile
-            sudo mkswap /swapfile &>> "$LOG_FILE"
-            sudo swapon /swapfile
-            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab > /dev/null
-            echo -e " ${GREEN}✓${NC}"
-        else
-            echo -e " ${YELLOW}Already exists${NC}"
-        fi
-    fi
-    
-    # Step 4: Optimize kernel
-    if ask_permission "Optimize kernel parameters?" "Sets swappiness=10 and cache_pressure=50 for better memory management"; then
-        echo -ne "   ${CYAN}[4/6]${NC} Optimizing kernel..."
-        if ! grep -q "vm.swappiness=10" /etc/sysctl.conf; then
-            echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf > /dev/null
-            echo 'vm.vfs_cache_pressure=50' | sudo tee -a /etc/sysctl.conf > /dev/null
-            sudo sysctl -p &>> "$LOG_FILE"
-        fi
-        echo -e " ${GREEN}✓${NC}"
-    fi
-    
-    # Step 5: Enable auto-update
-    if ask_permission "Enable container auto-updates?" "Automatically updates containers daily. Keeps your services secure"; then
-        echo -ne "   ${CYAN}[5/6]${NC} Enabling auto-update..."
-        sudo -u $SUDO_USER systemctl --user enable --now podman-auto-update.timer &>> "$LOG_FILE" || true
-        echo -e " ${GREEN}✓${NC}"
-    fi
-    
-    # Step 6: Final checks
-    echo -ne "   ${CYAN}[6/6]${NC} Final checks..."
-    sleep 1
-    echo -e " ${GREEN}✓${NC}\n"
-}
+# ============================================================
+# REMOVE SERVICE
+# ============================================================
+remove_service() {
+    echo -e "${RED}🗑️  Remove Service${NC}\n"
 
-# Final report
-show_report() {
-    local ram_available=$(free -m | awk '/^Mem:/{print $7}')
-    local swap_total=$(free -h | awk '/^Swap:/{print $2}')
-    local tailscale_ip=$(tailscale ip -4 2>/dev/null || echo "Not configured")
-    
-    echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║${NC}                  ${GREEN}${BOLD}✨ SETUP COMPLETE! ✨${NC}                   ${GREEN}║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
-    
-    echo -e "${BLUE}📊 VM Status:${NC}"
-    echo "   ┌─────────────────────────────────────────────────────┐"
-    printf "   │ RAM Available:       %-30s │\n" "${ram_available} MB"
-    printf "   │ Swap:                %-30s │\n" "${swap_total}"
-    printf "   │ Tailscale IP:        %-30s │\n" "${tailscale_ip}"
-    printf "   │ Services:            %-30s │\n" "Podman, Tailscale, Auto-update"
-    echo "   └─────────────────────────────────────────────────────┘"
-    echo ""
-    
-    echo -e "${GREEN}🚀 Next Steps:${NC}\n"
-    echo -e "${YELLOW}1.${NC} Deploy your first container:"
-    echo -e "   ${CYAN}podman run -d --name web -p 8080:80 nginx:alpine${NC}\n"
-    
-    echo -e "${YELLOW}2.${NC} Access via Tailscale:"
-    if [[ "$tailscale_ip" != "Not configured" ]]; then
-        echo -e "   ${CYAN}http://${tailscale_ip}:8080${NC}\n"
+    local running
+    running=$(podman ps -a --format "{{.Names}}" 2>/dev/null)
+    if [[ -z "$running" ]]; then
+        print_info "No services deployed."
+        return
+    fi
+
+    echo -e "${BOLD}Containers:${NC}\n"
+    local idx=1
+    local containers=()
+    while IFS= read -r name; do
+        local status
+        status=$(podman inspect "$name" --format "{{.State.Status}}" 2>/dev/null)
+        echo -e "   ${YELLOW}[$idx]${NC} $name ${DIM}($status)${NC}"
+        containers+=("$name")
+        ((idx++))
+    done <<< "$running"
+
+    echo -e "   ${YELLOW}[0]${NC} Cancel\n"
+
+    read -p "$(echo -e "${BOLD}Remove which service? [0-$((idx-1))]:${NC} ")" choice
+    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+        return
+    fi
+
+    if [[ $choice -ge 1 ]] && [[ $choice -lt $idx ]]; then
+        local target="${containers[$((choice-1))]}"
+
+        echo -e "\n${YELLOW}This will:${NC}"
+        echo -e "   • Stop and remove container: $target"
+        echo -e "   • Remove systemd service (if any)"
+        echo -e "   ${DIM}Note: Data volumes in $PROJECTS_DIR are NOT deleted${NC}\n"
+
+        read -p "$(echo -e "${BOLD}Confirm removal? [y/N]:${NC} ")" confirm
+        case "$confirm" in
+            [Yy]*)
+                echo -ne "   ${CYAN}→${NC} Removing $target..."
+                podman stop "$target" &>/dev/null || true
+                podman rm -f "$target" &>/dev/null || true
+                # Remove systemd service
+                rm -f "/etc/systemd/system/podman-${target}.service" 2>/dev/null
+                systemctl daemon-reload &>/dev/null || true
+                # Clean from registry
+                sed -i "/^[^|]*|${target}|/d" "$DEPLOY_REGISTRY" 2>/dev/null || true
+                echo -e " ${GREEN}✓${NC}"
+                print_success "$target removed"
+                print_info "Data preserved in $PROJECTS_DIR/"
+                ;;
+            *)
+                echo -e "${CYAN}Cancelled.${NC}"
+                ;;
+        esac
     else
-        echo -e "   ${CYAN}Configure Tailscale first: sudo tailscale up${NC}\n"
+        print_error "Invalid choice"
     fi
-    
-    echo -e "${YELLOW}3.${NC} Check status anytime:"
-    echo -e "   ${CYAN}xecurenet status${NC}\n"
-    
-    echo -e "${BLUE}📝 Logs:${NC} $LOG_FILE"
-    echo -e "${BLUE}💡 Help:${NC} xecurenet --help\n"
 }
 
-# Self-removal
-self_remove() {
-    echo -e "${YELLOW}🗑️  Cleanup${NC}\n"
-    echo -e "${CYAN}Setup is complete! The ${BOLD}xecurenet${NC}${CYAN} command is now available system-wide.${NC}"
-    echo -e "${CYAN}Would you like to remove this installation script?${NC}\n"
-    
-    read -p "$(echo -e "${BOLD}Remove installer? [y/N]:${NC} ")" remove
-    case "$remove" in
-        [Yy]* )
-            if [[ -f "$SCRIPT_PATH" ]] && [[ "$SCRIPT_PATH" != "/usr/local/bin/xecurenet" ]]; then
-                rm -f "$SCRIPT_PATH"
-                echo -e "${GREEN}✓${NC} Installer removed: $SCRIPT_PATH"
-                echo -e "${CYAN}💡 You can still use: ${BOLD}xecurenet${NC}${CYAN} command${NC}\n"
-            else
-                echo -e "${YELLOW}⚠️  Skipped (system installation)${NC}\n"
-            fi
-            ;;
-        * )
-            echo -e "${CYAN}ℹ️  Installer kept at: $SCRIPT_PATH${NC}\n"
-            ;;
-    esac
-}
-
-# Status command
-show_status() {
-    show_banner
-    
-    local ram_total=$(free -m | awk '/^Mem:/{print $2}')
-    local ram_used=$(free -m | awk '/^Mem:/{print $3}')
-    local ram_available=$(free -m | awk '/^Mem:/{print $7}')
-    local swap_total=$(free -h | awk '/^Swap:/{print $2}')
-    local swap_used=$(free -h | awk '/^Swap:/{print $3}')
-    local tailscale_ip=$(tailscale ip -4 2>/dev/null || echo "Not configured")
-    local tailscale_status=$(systemctl is-active tailscaled 2>/dev/null || echo "inactive")
-    local containers=$(podman ps -q 2>/dev/null | wc -l)
-    local podman_status="Active"
-    command -v podman &>/dev/null || podman_status="Not installed"
-    
-    echo -e "${BLUE}📊 System Status${NC}\n"
-    
-    echo -e "   ${CYAN}Memory:${NC}"
-    echo "   ├─ Total:     ${ram_total} MB"
-    echo "   ├─ Used:      ${ram_used} MB"
-    echo "   └─ Available: ${GREEN}${ram_available} MB${NC}"
-    echo ""
-    
-    echo -e "   ${CYAN}Swap:${NC}"
-    echo "   ├─ Total: ${swap_total}"
-    echo "   └─ Used:  ${swap_used}"
-    echo ""
-    
-    echo -e "   ${CYAN}Network:${NC}"
-    if [[ "$tailscale_ip" != "Not configured" ]]; then
-        echo "   └─ Tailscale IP: ${GREEN}${tailscale_ip}${NC}"
-    else
-        echo "   └─ Tailscale IP: ${YELLOW}Not configured${NC}"
-    fi
-    echo ""
-    
-    echo -e "   ${CYAN}Containers:${NC}"
-    echo "   └─ Running: ${GREEN}${containers}${NC}"
-    echo ""
-    
-    echo -e "   ${CYAN}Services:${NC}"
-    echo "   ├─ Podman:        ${GREEN}✓${NC} $podman_status"
-    [[ "$tailscale_status" == "active" ]] && echo "   ├─ Tailscale:     ${GREEN}✓${NC} Connected" || echo "   ├─ Tailscale:     ${YELLOW}⚠${NC} $tailscale_status"
-    echo "   └─ Auto-update:   ${GREEN}✓${NC} Enabled"
-    echo ""
-}
-
-# Help
+# ============================================================
+# HELP
+# ============================================================
 show_help() {
     show_banner
     echo -e "${BOLD}Usage:${NC} xecurenet [command]\n"
-    echo -e "${BOLD}Commands:${NC}"
-    echo -e "   ${CYAN}setup${NC}       Initial VM setup (interactive)"
-    echo -e "   ${CYAN}status${NC}      Show current VM status"
-    echo -e "   ${CYAN}optimize${NC}    Re-run optimization steps"
-    echo -e "   ${CYAN}tailscale${NC}   Configure Tailscale"
-    echo -e "   ${CYAN}--help${NC}      Show this help message"
-    echo -e "   ${CYAN}--version${NC}   Show version information\n"
-    
+    echo -e "${BOLD}Setup Commands:${NC}"
+    echo -e "   ${CYAN}setup${NC}        Initial VM setup (scan + optimize + configure)"
+    echo -e "   ${CYAN}scan${NC}         Scan VM specifications"
+    echo -e "   ${CYAN}tailscale${NC}    Configure Tailscale networking\n"
+
+    echo -e "${BOLD}Deploy Commands:${NC}"
+    echo -e "   ${CYAN}deploy${NC}       Interactive service deployment (6-phase wizard)"
+    echo -e "   ${CYAN}services${NC}     List all 25 available services"
+    echo -e "   ${CYAN}remove${NC}       Remove a deployed service\n"
+
+    echo -e "${BOLD}Info Commands:${NC}"
+    echo -e "   ${CYAN}status${NC}       Show VM and service status"
+    echo -e "   ${CYAN}--help${NC}       Show this help message"
+    echo -e "   ${CYAN}--version${NC}    Show version information\n"
+
+    echo -e "${BOLD}Environment Variables:${NC}"
+    echo -e "   ${CYAN}XECURENET_MODE=agent${NC}     Run in agent mode (no prompts)"
+    echo -e "   ${CYAN}TAILSCALE_AUTHKEY=...${NC}    Tailscale auth key for agent mode\n"
+
     echo -e "${BOLD}Examples:${NC}"
-    echo -e "   ${YELLOW}sudo xecurenet setup${NC}      # Run initial setup"
-    echo -e "   ${YELLOW}xecurenet status${NC}          # Check VM status"
-    echo -e "   ${YELLOW}sudo xecurenet optimize${NC}   # Re-optimize VM\n"
-    
+    echo -e "   ${YELLOW}sudo xecurenet setup${NC}                       # Initial setup"
+    echo -e "   ${YELLOW}sudo xecurenet deploy${NC}                      # Deploy services"
+    echo -e "   ${YELLOW}xecurenet status${NC}                           # Check everything"
+    echo -e "   ${YELLOW}xecurenet services${NC}                         # Browse catalog"
+    echo -e "   ${YELLOW}XECURENET_MODE=agent sudo xecurenet setup${NC}  # Unattended\n"
+
     echo -e "${BOLD}Support:${NC}"
     echo -e "   📱 Telegram: ${CYAN}@AsimAiCoder${NC}"
-    echo -e "   🐙 GitHub: ${CYAN}https://github.com/asimaicoder/XecureNet${NC}"
-    echo -e "   📖 Docs: ${CYAN}https://github.com/asimaicoder/XecureNet#readme${NC}\n"
+    echo -e "   🐙 GitHub: ${CYAN}https://github.com/asimaicoder/XecureNet${NC}\n"
 }
 
-# Main setup
+# ============================================================
+# TAILSCALE SETUP (interactive)
+# ============================================================
+setup_tailscale() {
+    echo -e "${CYAN}🔐 Tailscale Setup${NC}\n"
+
+    ensure_tailscale
+
+    if [[ "$SETUP_MODE" == "agent" ]]; then
+        if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
+            tailscale up --authkey="$TAILSCALE_AUTHKEY" &>>"$LOG_FILE"
+            local ts_ip
+            ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+            print_success "Authenticated with auth key"
+            [[ -n "$ts_ip" ]] && print_success "Tailscale IP: $ts_ip"
+        else
+            print_warning "No TAILSCALE_AUTHKEY env var. Run: sudo tailscale up"
+        fi
+        return
+    fi
+
+    echo -e "${YELLOW}[1]${NC} ${BOLD}Auth Key${NC} ${GREEN}(Recommended)${NC}"
+    echo -e "    ${CYAN}→${NC} Get from: https://login.tailscale.com/admin/settings/keys\n"
+    echo -e "${YELLOW}[2]${NC} ${BOLD}OAuth (Browser)${NC}"
+    echo -e "    ${CYAN}→${NC} Opens browser for login\n"
+    echo -e "${YELLOW}[3]${NC} ${BOLD}Skip${NC}\n"
+
+    while true; do
+        read -p "$(echo -e "${BOLD}Choice [1-3]:${NC} ")" choice
+        case $choice in
+            1)
+                read -sp "$(echo -e "${BOLD}Auth key (hidden):${NC} ")" authkey
+                echo ""
+                if [[ -n "$authkey" ]]; then
+                    tailscale up --authkey="$authkey" &>>"$LOG_FILE"
+                    local ts_ip
+                    ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+                    print_success "Authenticated"
+                    [[ -n "$ts_ip" ]] && print_success "Tailscale IP: $ts_ip"
+                else
+                    print_error "No key provided"
+                fi
+                break
+                ;;
+            2)
+                tailscale up
+                print_success "Authenticated via OAuth"
+                break
+                ;;
+            3)
+                print_warning "Skipped. Run 'sudo tailscale up' later."
+                break
+                ;;
+            *) echo -e "${RED}Enter 1, 2, or 3${NC}" ;;
+        esac
+    done
+    echo ""
+}
+
+# ============================================================
+# VM OPTIMIZATION (for setup command)
+# ============================================================
+optimize_vm() {
+    echo -e "${YELLOW}⚙️  VM Optimization${NC}\n"
+
+    detect_os
+
+    if ask_permission "Remove bloat packages?" "Removes unattended-upgrades, chrony (~100MB saved)"; then
+        echo -ne "   ${CYAN}→${NC} Removing bloat..."
+        systemctl stop unattended-upgrades 2>/dev/null || true
+        systemctl disable unattended-upgrades 2>/dev/null || true
+        apt purge -y unattended-upgrades chrony &>>"$LOG_FILE" || true
+        apt autoremove -y &>>"$LOG_FILE" || true
+        echo -e " ${GREEN}✓${NC}"
+    fi
+
+    if ask_permission "Install Podman?" "Lightweight container runtime (~30MB)"; then
+        ensure_podman
+    fi
+
+    if ask_permission "Create 2GB swap?" "Prevents OOM kills on low-RAM VMs"; then
+        ensure_swap
+    fi
+
+    if ask_permission "Optimize kernel?" "Sets swappiness=10, cache_pressure=50"; then
+        if ! grep -q "vm.swappiness=10" /etc/sysctl.conf 2>/dev/null; then
+            echo 'vm.swappiness=10' | tee -a /etc/sysctl.conf > /dev/null
+        fi
+        if ! grep -q "vm.vfs_cache_pressure=50" /etc/sysctl.conf 2>/dev/null; then
+            echo 'vm.vfs_cache_pressure=50' | tee -a /etc/sysctl.conf > /dev/null
+        fi
+        sysctl -p &>>"$LOG_FILE" || true
+        print_success "Kernel optimized"
+    fi
+
+    echo ""
+}
+
+# ============================================================
+# DEPLOY INTERACTIVE (main orchestrator — 6 phases)
+# ============================================================
+deploy_interactive() {
+    show_banner
+
+    # Check Podman
+    if ! command -v podman &>/dev/null; then
+        print_error "Podman not installed. Run 'sudo xecurenet setup' first."
+        exit 1
+    fi
+
+    echo -e "${GREEN}${BOLD}🚀 XecureNet Deploy Wizard${NC}\n"
+    echo -e "${DIM}   6-phase deployment: Scan → Select → Inputs → Budget → Deploy → Summary${NC}\n"
+
+    # Phase 0: VM Scan
+    vm_scan
+
+    # Phase 1+2: Select services + Collect inputs
+    echo -e "${BLUE}${BOLD}📦 Phase 1: Service Selection${NC}\n"
+    select_services || return
+    collect_inputs
+
+    # Phase 3: RAM Budget Check
+    ram_budget_check || return
+
+    # Pre-deploy: ensure base dependencies
+    echo -e "${BLUE}${BOLD}🔧 Pre-Deploy Setup${NC}\n"
+    ensure_swap
+    ensure_podman
+
+    # Check if any service needs Tailscale/Cloudflare
+    local needs_tailscale=false
+    local needs_cloudflare=false
+    for i in "${!SELECTED_IDS[@]}"; do
+        [[ "${SEL_ACCESS[$i]}" == "funnel" ]] && needs_tailscale=true
+        [[ "${SEL_ACCESS[$i]}" == "cloudflare" ]] && needs_cloudflare=true
+    done
+    $needs_tailscale && ensure_tailscale
+    $needs_cloudflare && ensure_cloudflared
+
+    # Phase 4: Deploy
+    echo -e "\n${BLUE}${BOLD}🚀 Phase 4: Deploying Services${NC}"
+
+    for i in "${!SELECTED_IDS[@]}"; do
+        deploy_single_service "$i" || true
+    done
+
+    # Setup access for each service
+    echo -e "\n${BLUE}${BOLD}🌐 Setting Up Access${NC}"
+    for i in "${!SELECTED_IDS[@]}"; do
+        setup_access "$i"
+    done
+
+    # Create systemd services
+    echo -e "\n${CYAN}⚙️  Creating auto-start services${NC}"
+    for i in "${!SELECTED_IDS[@]}"; do
+        local sid="${SELECTED_IDS[$i]}"
+        local cname="${SEL_CONTAINER[$i]}"
+        if [[ "$sid" == "pg-redis" ]]; then
+            create_systemd_service "${cname}-pg"
+            create_systemd_service "${cname}-redis"
+        else
+            create_systemd_service "$cname"
+        fi
+    done
+    print_success "Systemd services created (auto-start on reboot)"
+
+    # Cleanup
+    run_cleanup
+
+    # Phase 5: Summary
+    print_summary_card
+    print_agent_training_card
+}
+
+# ============================================================
+# MAIN SETUP (for 'setup' command)
+# ============================================================
 main_setup() {
     show_banner
     check_root
     select_mode
-    system_check
+    vm_scan
     setup_tailscale
     optimize_vm
-    show_report
-    self_remove
+
+    echo -e "${GREEN}${BOLD}✨ Setup Complete!${NC}\n"
+    echo -e "${GREEN}Next:${NC} ${CYAN}sudo xecurenet deploy${NC} to start deploying services\n"
 }
 
-# Main
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
 case "${1:-}" in
     setup)
         main_setup
+        ;;
+    scan)
+        show_banner
+        detect_os
+        vm_scan
         ;;
     status)
         show_status
@@ -451,6 +2496,19 @@ case "${1:-}" in
         show_banner
         setup_tailscale
         ;;
+    deploy)
+        check_root
+        deploy_interactive
+        ;;
+    services)
+        show_banner
+        show_services_menu
+        ;;
+    remove)
+        check_root
+        show_banner
+        remove_service
+        ;;
     --help|-h)
         show_help
         ;;
@@ -459,7 +2517,12 @@ case "${1:-}" in
         echo -e "Made with ❤️  by ${MAGENTA}Asim Coder${NC}"
         echo -e "Telegram: ${CYAN}@AsimAiCoder${NC}"
         ;;
+    "")
+        show_help
+        ;;
     *)
-        main_setup
+        print_error "Unknown command: $1"
+        echo -e "Run ${CYAN}xecurenet --help${NC} to see available commands."
+        exit 1
         ;;
 esac
